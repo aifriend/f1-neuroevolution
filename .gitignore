@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Training artifacts
+best-brain-*.json
+training-live*.log
+training.log
+
+# Autoresearch intermediate state
+.autoresearch/results.jsonl
+.autoresearch/state.json
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.specstory/
+
+# Logs
+*.log
+!README.md
