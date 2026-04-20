@@ -1,9 +1,9 @@
 import * as THREE from 'three';
-import { Track } from './track.js?v=5';
-import { initialCars, nextGeneration, restoreState } from './evolution.js?v=5';
-import { Hud } from './hud.js?v=5';
-import { isDebugMode, parseBrainJson } from './main-utils.js?v=5';
-import { TRACK_DEFAULT_WIDTHS } from './evolution-core.js?v=5';
+import { Track } from './track.js?v=29';
+import { initialCars, nextGeneration, restoreState, persistState } from './evolution.js?v=29';
+import { Hud } from './hud.js?v=29';
+import { createQuitController, isDebugMode, parseBrainJson, parseVisualRuntimeParams } from './main-utils.js?v=29';
+import { TRACK_DEFAULT_WIDTHS } from './evolution-core.js?v=29';
 
 const state = {
   renderer: null,
@@ -25,17 +25,23 @@ const state = {
   _currentMutation: 0.08,
   _bestWeights: null,
   _loadedWeights: null,
+  _loadedPopulation: null,
   _difficultyLevel: 0,
   _bestLapStagnantGens: 0,
+  _plateauConsecutiveChecks: 0,
+  _plateauAvgHistory: [],
+  _plateauFinishedRateHistory: [],
+  _plateauStatus: null,
+  _escalationStatus: null,
   _onEscalation: null,
   orbit: { azimuth: 0, elevation: 0.6, distance: 400, autoSpin: true },
   settings: {
     trackType: 'monaco',
-    numCars: 80,
+    numCars: 30,
     speedMult: 1,
-    mutationRate: 0.05,
+    mutationRate: 0.08,
     timeoutEnabled: true,
-    timeoutDuration: 1200,
+    timeoutDuration: 3500,
   },
 };
 
@@ -43,10 +49,15 @@ export function main(canvas, hudCanvas) {
   if (isDebugMode(window.location.search)) {
     window.__state = state;
   }
+  // Viewport may be 0×0 when loaded hidden (e.g., in a background iframe).
+  // Fall back to a sane default so canvases can render; real resize handled later.
+  const getW = () => window.innerWidth || document.documentElement.clientWidth || 1024;
+  const getH = () => window.innerHeight || document.documentElement.clientHeight || 768;
+
   // ─── Renderer ──────────────────────────────────
   state.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   state.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  state.renderer.setSize(window.innerWidth, window.innerHeight);
+  state.renderer.setSize(getW(), getH());
   state.renderer.shadowMap.enabled = true;
   state.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   state.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -83,21 +94,59 @@ export function main(canvas, hudCanvas) {
 
   // ─── Camera ────────────────────────────────────
   state.camera = new THREE.PerspectiveCamera(
-    65, window.innerWidth / window.innerHeight, 0.1, 4000
+    65, getW() / getH(), 0.1, 4000
   );
   // Start in top-down view centered on track
   state.camera.position.set(0, 620, 40);
   state.camera.lookAt(0, 0, 0);
+
+  // ─── URL param defaults ────────────────────────
+  const $ = (id) => document.getElementById(id);
+  const syncSettingsControls = () => {
+    const trackSelect = $('track-select');
+    if (trackSelect) trackSelect.value = state.settings.trackType;
+    const cars = $('num-cars');
+    if (cars) cars.value = String(state.settings.numCars);
+    const carsVal = $('num-cars-val');
+    if (carsVal) carsVal.textContent = String(state.settings.numCars);
+    const speed = $('speed-mult');
+    if (speed) speed.value = String(state.settings.speedMult);
+    const speedVal = $('speed-val');
+    if (speedVal) speedVal.textContent = state.settings.speedMult.toFixed(1) + 'x';
+    const mut = $('mutation-rate');
+    if (mut) mut.value = String(state.settings.mutationRate);
+    const mutVal = $('mutation-val');
+    if (mutVal) mutVal.textContent = state.settings.mutationRate.toFixed(2);
+    const toEn = $('timeout-enabled');
+    if (toEn) toEn.checked = Boolean(state.settings.timeoutEnabled);
+    const toDur = $('timeout-duration');
+    if (toDur) toDur.value = String(state.settings.timeoutDuration);
+    const resetCb = $('reset-training');
+    if (resetCb) resetCb.checked = false;
+  };
+  const allowedTracks = Object.keys(TRACK_DEFAULT_WIDTHS);
+  const params = parseVisualRuntimeParams(window.location.search, { allowedTracks });
+  if (params.fresh) {
+    try { localStorage.removeItem('f1-neuroevo-state'); } catch {}
+  }
+  if (params.trackType) state.settings.trackType = params.trackType;
+  if (params.numCars != null) state.settings.numCars = params.numCars;
+  if (params.speedMult != null) state.settings.speedMult = params.speedMult;
+  if (params.mutationRate != null) state.settings.mutationRate = params.mutationRate;
+  if (params.timeoutEnabled != null) state.settings.timeoutEnabled = params.timeoutEnabled;
+  if (params.timeoutDuration != null) state.settings.timeoutDuration = params.timeoutDuration;
+
+  // Sync UI controls to chosen defaults before any restoreState() happens.
+  syncSettingsControls();
 
   // ─── Track ─────────────────────────────────────
   state.track = new Track(state.settings.trackType);
   state.scene.add(state.track.mesh);
 
   // ─── Restore saved training state (survives reloads) ───
-  const restored = restoreState(state);
+  const restored = params.fresh ? false : restoreState(state);
   if (restored) {
-    const trackSelect = document.getElementById('track-select');
-    if (trackSelect) trackSelect.value = state.settings.trackType;
+    syncSettingsControls();
     console.log(`Restored training: Gen ${state.generation}, Lv${state._difficultyLevel || 0}, ${state.settings.trackType}`);
   }
 
@@ -160,7 +209,6 @@ export function main(canvas, hudCanvas) {
   }, { passive: false });
 
   // ─── Settings UI ───────────────────────────────
-  const $ = (id) => document.getElementById(id);
   const statusEl = $('status-msg');
   let statusTimer = null;
 
@@ -174,6 +222,11 @@ export function main(canvas, hudCanvas) {
       statusEl.className = 'status-msg';
     }, 5000);
   }
+
+  const quitController = createQuitController(() => {
+    persistState(state);
+    setStatus('Quit. Reload the page to resume.', 'warn');
+  });
 
   // Curriculum escalation callback
   state._onEscalation = (step, level) => {
@@ -195,6 +248,10 @@ export function main(canvas, hudCanvas) {
 
   $('apply-btn').addEventListener('click', () => {
     const newTrack = $('track-select').value;
+    const resetTraining = $('reset-training').checked;
+    const carryPopulation = !resetTraining
+      ? state.cars.map((car) => car.brain.getWeights())
+      : null;
     state.settings.numCars = parseInt($('num-cars').value);
     state.settings.speedMult = parseFloat($('speed-mult').value);
     state.settings.mutationRate = parseFloat($('mutation-rate').value);
@@ -216,23 +273,47 @@ export function main(canvas, hudCanvas) {
       state.scene.add(state.track.mesh);
     }
 
-    // Reset state
-    state.generation = 1;
-    state.bestScore = 0;
-    state.allTimeBest = 0;
-    state.bestLapTime = Infinity;
-    state.genBestLap = Infinity;
-    state.lapHistory = [];
-    state._stagnantGens = 0;
-    state._bestWeights = null;
-    state._difficultyLevel = 0;
-    state._bestLapStagnantGens = 0;
-    try { localStorage.removeItem('f1-neuroevo-state'); } catch {}
-    state.bestCar = null;
-    state.cameraMode = 'top';
-    document.getElementById('cam-mode').textContent = 'top';
+    if (resetTraining) {
+      // Clean reset: wipe all evolutionary progress + persisted snapshot.
+      state.generation = 1;
+      state.frameCounter = 0;
+      state.bestScore = 0;
+      state.allTimeBest = 0;
+      state.bestLapTime = Infinity;
+      state.genBestLap = Infinity;
+      state.lapHistory = [];
+      state._stagnantGens = 0;
+      state._bestWeights = null;
+      state._loadedWeights = null;
+      state._loadedPopulation = null;
+      state._difficultyLevel = 0;
+      state._bestLapStagnantGens = 0;
+      state._plateauConsecutiveChecks = 0;
+      state._plateauAvgHistory = [];
+      state._plateauFinishedRateHistory = [];
+      state._plateauStatus = null;
+      state._escalationStatus = null;
+      try { localStorage.removeItem('f1-neuroevo-state'); } catch {}
+      state.bestCar = null;
+      state.cameraMode = 'top';
+      document.getElementById('cam-mode').textContent = 'top';
+    } else {
+      // Restart sim from currently trained population with updated settings.
+      state.frameCounter = 0;
+      state.bestCar = null;
+      state._loadedPopulation = carryPopulation;
+      state._loadedWeights = null;
+    }
 
     state.cars = initialCars(state);
+    persistState(state);
+    $('reset-training').checked = false;
+    setStatus(
+      resetTraining
+        ? 'Applied. Training reset to clean start.'
+        : 'Applied. Restarted from current training snapshot.',
+      'ok'
+    );
   });
 
   // Save / Load brain
@@ -248,7 +329,7 @@ export function main(canvas, hudCanvas) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `best-brain-gen${state.generation}.json`;
+      a.download = `models/best-brain-gen${state.generation}.json`;
       a.click();
       URL.revokeObjectURL(url);
       setStatus('Brain saved.', 'ok');
@@ -279,12 +360,23 @@ export function main(canvas, hudCanvas) {
     reader.readAsText(file);
   });
 
+  $('quit-btn').addEventListener('click', () => {
+    quitController.requestQuit();
+  });
+
   // ─── Resize ────────────────────────────────────
   window.addEventListener('resize', () => {
-    state.renderer.setSize(window.innerWidth, window.innerHeight);
-    state.camera.aspect = window.innerWidth / window.innerHeight;
+    state.renderer.setSize(getW(), getH());
+    state.camera.aspect = getW() / getH();
     state.camera.updateProjectionMatrix();
     hud.resize();
+  });
+
+  // Save state on reload/close so we don't lose progress
+  window.addEventListener('beforeunload', () => { persistState(state); });
+  // visibilitychange also fires when the tab is hidden (mobile/iframe quirks)
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) persistState(state);
   });
 
   // ─── FPS tracking ──────────────────────────────
@@ -294,35 +386,61 @@ export function main(canvas, hudCanvas) {
   // ─── Previous best car (for sensor cleanup) ────
   let prevBestCar = null;
 
-  // ─── Animation Loop ────────────────────────────
-  function tick() {
-    requestAnimationFrame(tick);
-
-    // Update all cars
-    for (const car of state.cars) {
-      car.update();
-    }
+  // ─── Physics step (single frame of simulation) ──
+  function physicsStep() {
+    for (const car of state.cars) car.update();
 
     // Find current best alive car
     state.bestCar = null;
     let bestScore = -1;
     for (const car of state.cars) {
-      if (car.alive && car.score > bestScore) {
-        bestScore = car.score;
-        state.bestCar = car;
-      }
+      if (car.alive && car.score > bestScore) { bestScore = car.score; state.bestCar = car; }
     }
-    // If no alive car, use highest scoring overall
     if (!state.bestCar) {
       for (const car of state.cars) {
-        if (car.score > bestScore) {
-          bestScore = car.score;
-          state.bestCar = car;
-        }
+        if (car.score > bestScore) { bestScore = car.score; state.bestCar = car; }
       }
     }
 
-    // Sensor beams: show only on best car
+    // Generation transition
+    state.frameCounter++;
+    const allDone = state.cars.every((c) => !c.alive || c.finished);
+    const timedOut = state.settings.timeoutEnabled &&
+      state.frameCounter > state.settings.timeoutDuration;
+    if (allDone || timedOut) {
+      if (timedOut) {
+        for (const c of state.cars) {
+          if (c.alive && !c.finished) {
+            c.alive = false;
+            if (!c.killReason || c.killReason === 'active') c.killReason = 'timeout';
+          }
+        }
+      }
+      prevBestCar = null;
+      nextGeneration(state);
+    }
+  }
+
+  // ─── Animation Loop ────────────────────────────
+  // When tab is hidden, browsers throttle rAF/setTimeout. To keep training
+  // progressing, run MANY physics steps per throttled tick and skip rendering.
+  function tick() {
+    if (quitController.isQuitRequested()) return;
+    if (document.hidden) {
+      // Background mode: batch physics, then render once so screenshots work
+      for (let i = 0; i < 200; i++) physicsStep();
+      updateCamera(state);
+      state.renderer.render(state.scene, state.camera);
+      hud.render(state);
+      setTimeout(tick, 0);
+      return;
+    }
+
+    // Foreground mode: single step + render at display rate
+    requestAnimationFrame(tick);
+    physicsStep();
+
+    // Sensor beams (visual only)
     if (prevBestCar && prevBestCar !== state.bestCar) {
       prevBestCar.showSensors(false, state.scene);
     }
@@ -331,27 +449,7 @@ export function main(canvas, hudCanvas) {
       prevBestCar = state.bestCar;
     }
 
-    // Check if generation is done
-    state.frameCounter++;
-    const allDone = state.cars.every((c) => !c.alive || c.finished);
-    const timedOut = state.settings.timeoutEnabled &&
-      state.frameCounter > state.settings.timeoutDuration;
-
-    if (allDone || timedOut) {
-      // Kill remaining cars on timeout
-      if (timedOut) {
-        for (const c of state.cars) {
-          if (c.alive && !c.finished) c.alive = false;
-        }
-      }
-      prevBestCar = null;
-      nextGeneration(state);
-    }
-
-    // Camera
     updateCamera(state);
-
-    // Render
     state.renderer.render(state.scene, state.camera);
     hud.render(state);
 

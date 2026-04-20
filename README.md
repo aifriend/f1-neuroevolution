@@ -24,12 +24,21 @@ python3 -m http.server 8000
 
 Then open [http://localhost:8000](http://localhost:8000).
 
+### One-command Monaco start (default params)
+
+This starts a static server, opens the browser at Monaco, and forces a fresh run
+ignoring any persisted localStorage training state.
+
+```bash
+bash scripts/run-visual-monaco.sh
+```
+
 Runtime controls in the UI:
 
-- Track: Monaco / Suzuka / Silverstone
+- Track: Monaco / Suzuka / Silverstone / Spaghetti / Serpentine / Inferno / Serpentine Bay / Ironcliff
 - Cars, speed multiplier, mutation rate
 - Timeout toggle and frame limit
-- Save Brain / Load Brain / Apply & Restart
+- Save Brain / Load Brain / Apply & Restart / Quit
 
 ## Run Headless Training
 
@@ -63,13 +72,13 @@ tail -f training-live.log
 
 Available flags:
 
-- `--track` (`monaco` | `suzuka` | `silverstone`)
+- `--track` (`monaco` | `suzuka` | `silverstone` | `spaghetti` | `serpentine` | `inferno` | `serpentine_bay` | `ironcliff`)
 - `--cars` (population size)
 - `--gens` (number of generations)
 - `--mutation` (base mutation rate)
 - `--timeout` (frame timeout)
 - `--speed` (simulation speed multiplier)
-- `--output` (output JSON file path)
+- `--output` (output JSON file path; defaults to `models/best-brain-<track>.json`)
 
 ## Test
 
@@ -84,6 +93,22 @@ Uses Vitest with tests in `tests/` for shared evolution and NN behavior.
 Loaded brain JSON must match the expected shape and finite-number constraints documented in `docs/runtime-and-brain-contract.md`.
 
 At runtime, invalid brain payloads are rejected and the simulator keeps running.
+
+## Plateau-Based Curriculum Escalation
+
+Difficulty no longer advances after a fixed generation count. Instead, escalation is
+triggered when learning is statistically flat:
+
+- EWMA slope of recent `avgProgress` is near zero
+- Relative improvement between adjacent windows is small
+- Progress variance is low (stable plateau, not noisy exploration)
+- Finisher rate is not still climbing materially
+- Plateau must be confirmed for multiple consecutive checks
+- At least one valid lap must exist before escalation can occur
+
+This policy is shared between browser runtime (`js/evolution.js`) and headless
+training (`train.js`) through `js/evolution-core.js`, so both modes make
+consistent level-jump decisions.
 
 ## Project Structure
 

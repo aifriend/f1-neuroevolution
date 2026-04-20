@@ -16,18 +16,47 @@ function flag(name, fallback) {
 }
 
 const TRACK_TYPE = flag('track', 'monaco');
-const NUM_CARS = parseInt(flag('cars', '50'));
+const NUM_CARS = parseInt(flag('cars', '30'));
 const NUM_GENS = parseInt(flag('gens', '500'));
 const MUTATION_RATE = parseFloat(flag('mutation', '0.05'));
-const TIMEOUT = parseInt(flag('timeout', '1500'));
+const TIMEOUT = parseInt(flag('timeout', '3500'));
 const SPEED_MULT = parseFloat(flag('speed', '1'));
-const OUTPUT_FILE = flag('output', `best-brain-${TRACK_TYPE}.json`);
+const OUTPUT_FILE = flag('output', `models/best-brain-${TRACK_TYPE}.json`);
+const LOAD_FILE = flag('load', null);
+// Two-phase training: each curriculum level trains at SLOW_SPEED first
+// (gentler physics → faster to learn track shape), then refines at SPEED_MULT
+// (full race speed). Escalation to the NEXT level only fires after both
+// phases on the current level plateau.
+//   Enable with: --twoPhase
+//   Slow speed:  --slow 0.5  (default)
+const SLOW_SPEED = parseFloat(flag('slow', '0.5'));
+const TWO_PHASE = args.includes('--twoPhase');
+// Disable LoRA freezing — clean A/B baseline against the LoRA-protected
+// runs. With --noLora, brains stay at level 0 internally (their full base
+// always mutates) regardless of which curriculum track they're on. This
+// is the catastrophic-forgetting baseline.
+const NO_LORA = args.includes('--noLora');
+// LoRA rank: how much capacity each per-level adapter has.
+//   rank 2 = 88 params/level (tight, max protection, low adaptation)
+//   rank 4 = 176 params/level (balanced)
+//   rank 8 = 352 params/level (high adaptation, still less than full base)
+const LORA_RANK_OVERRIDE = parseInt(flag('rank', '2'), 10);
+// Soft freeze: at level >= 1, mutate the base at this fraction of the
+// adapter's mutation rate. 0 = strict freeze (no forgetting); >0 = base
+// drifts slowly so the universal feature extractor can still improve as
+// new tracks are encountered.
+const SOFT_FREEZE = parseFloat(flag('softFreeze', '0'));
+// Optional explicit track-width override. Useful for targeting a specific
+// curriculum level's geometry without going through escalation
+// (e.g. --track ironcliff --width 16 to dwell on level 9).
+const WIDTH_OVERRIDE = args.includes('--width') ? parseInt(flag('width'), 10) : null;
 
-// ─── Import shared evolution logic ───────────────────
-// These functions are the SAME ones used by the visual frontend,
-// ensuring headless and visual training produce identical behavior.
+// ─── Import shared evolution + neural-network logic ──
+// Headless and visual trainers share the EXACT same NeuralCar (with LoRA
+// continual learning), so brain JSON saved by either side loads in the other.
 const {
   computeAdaptiveMutation,
+  evaluatePlateauStatus,
   tournamentSelect,
   getTieredMutationRate,
   computeScore,
@@ -35,156 +64,14 @@ const {
   TRACK_DEFAULT_WIDTHS,
 } = await import('./js/evolution-core.js');
 const { computeInterpolationSteps } = await import('./js/track-geometry.js');
-
-// ─── Neural Network (from nn.js) ─────────────────────
+const { NeuralCar, NUM_INPUTS, HIDDEN_SIZE } = await import('./js/nn.js');
+// Canonical curriculum track definitions (shared with js/track.js).
+// Drift between headless and visual physics is now architecturally impossible.
+const { TRACKS } = await import('./js/track-data.js');
 const NUM_SENSORS = 9;
-const NUM_INPUTS = NUM_SENSORS + 1; // sensors + speed
-const HIDDEN_SIZE = 16;
-
-function randomGaussian(mean = 0, std = 1) {
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return mean + std * Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
-}
-
-class NeuralCar {
-  constructor(weights) {
-    if (!weights) {
-      const scale1 = 0.8;
-      const scale2 = 0.6;
-      this.w1 = this._randomMatrix(NUM_INPUTS, HIDDEN_SIZE, scale1);
-      this.b1 = new Array(HIDDEN_SIZE).fill(0);
-      this.w2 = this._randomMatrix(HIDDEN_SIZE, 2, scale2);
-      this.b2 = new Array(2).fill(0);
-    } else {
-      this.w1 = weights.w1.map((r) => [...r]);
-      this.b1 = [...(weights.b1 || new Array(HIDDEN_SIZE).fill(0))];
-      this.w2 = weights.w2.map((r) => [...r]);
-      this.b2 = [...(weights.b2 || new Array(2).fill(0))];
-    }
-  }
-
-  _randomMatrix(rows, cols, scale = 1) {
-    const m = [];
-    for (let i = 0; i < rows; i++) {
-      const row = [];
-      for (let j = 0; j < cols; j++) row.push(randomGaussian(0, scale));
-      m.push(row);
-    }
-    return m;
-  }
-
-  _randomVector(size) {
-    return Array.from({ length: size }, () => randomGaussian(0, 0.5));
-  }
-
-  think(sensors) {
-    const hidden = [];
-    for (let j = 0; j < HIDDEN_SIZE; j++) {
-      let sum = this.b1[j];
-      for (let i = 0; i < sensors.length; i++) sum += sensors[i] * this.w1[i][j];
-      hidden.push(Math.tanh(sum));
-    }
-    const output = [];
-    for (let j = 0; j < 2; j++) {
-      let sum = this.b2[j];
-      for (let i = 0; i < HIDDEN_SIZE; i++) sum += hidden[i] * this.w2[i][j];
-      output.push(Math.tanh(sum));
-    }
-    return { steer: output[0], gas: output[1] };
-  }
-
-  mutate(rate) {
-    for (let i = 0; i < this.w1.length; i++)
-      for (let j = 0; j < this.w1[i].length; j++)
-        this.w1[i][j] += randomGaussian(0, 1) * rate;
-    for (let i = 0; i < this.b1.length; i++)
-      this.b1[i] += randomGaussian(0, 1) * rate;
-    for (let i = 0; i < this.w2.length; i++)
-      for (let j = 0; j < this.w2[i].length; j++)
-        this.w2[i][j] += randomGaussian(0, 1) * rate;
-    for (let i = 0; i < this.b2.length; i++)
-      this.b2[i] += randomGaussian(0, 1) * rate;
-  }
-
-  getWeights() {
-    return {
-      w1: this.w1.map((r) => [...r]),
-      b1: [...this.b1],
-      w2: this.w2.map((r) => [...r]),
-      b2: [...this.b2],
-    };
-  }
-}
 
 // ─── Track Physics (from track.js, no Three.js) ──────
 const SENSOR_LENGTH = 220;
-
-const TRACKS = {
-  monaco: {
-    name: 'Monaco', width: 28,
-    points: [
-      [0,0],[100,5],[160,35],[180,85],
-      [170,145],[130,180],[80,185],[50,160],
-      [35,120],[55,85],[40,45],[10,15],
-    ],
-  },
-  suzuka: {
-    name: 'Suzuka', width: 30,
-    points: [
-      [-80,0],[-115,95],[-125,200],[-110,305],
-      [-70,370],[0,405],[55,370],[75,320],
-      [100,375],[155,410],[215,360],
-      [235,275],[225,185],[200,100],[170,25],
-      [140,-60],[110,25],[80,-60],
-      [50,25],[20,-60],[-20,15],[-55,-10],
-    ],
-  },
-  silverstone: {
-    name: 'Silverstone', width: 32,
-    points: [
-      [0,0],[120,10],[180,40],[200,100],[185,160],
-      [150,200],[170,260],[200,320],[180,390],[130,430],
-      [60,440],[0,420],[-30,370],[-60,320],[-40,270],
-      [-70,210],[-90,140],[-80,70],[-50,25],[-20,5],
-    ],
-  },
-  spaghetti: {
-    name: 'Spaghetti', width: 26,
-    points: [
-      [0,0],[70,-10],[130,-45],[150,-100],
-      [125,-160],[160,-210],[130,-270],[165,-320],
-      [120,-360],[60,-370],[10,-340],[-20,-280],
-      [15,-230],[-25,-175],[10,-120],[-20,-60],[-5,-10],
-    ],
-  },
-  serpentine: {
-    name: 'Serpentine', width: 24,
-    points: [
-      [0,0],[55,-20],[85,15],[140,-10],[160,25],
-      [200,55],[170,100],[215,135],[185,180],[225,215],
-      [195,265],[155,285],[180,325],
-      [135,345],[100,315],[65,350],
-      [25,320],[50,280],[-10,240],
-      [30,200],[-20,155],[20,110],
-      [-30,70],[10,35],[-10,10],
-    ],
-  },
-  inferno: {
-    name: 'Inferno', width: 22,
-    points: [
-      [0,0],[70,25],[-10,60],[80,105],[5,135],
-      [55,180],[-20,220],[75,250],[10,295],
-      [65,335],[-15,365],[45,410],[0,445],
-      [60,475],[120,480],[160,455],
-      [190,420],[250,395],[170,355],[240,320],
-      [160,280],[260,250],[175,210],[235,170],
-      [155,140],[245,105],[180,70],[250,35],
-      [185,0],[140,-25],[80,-30],[30,-15],
-    ],
-  },
-};
 
 class HeadlessTrack {
   constructor(type, widthOverride = null) {
@@ -312,7 +199,7 @@ const SENSOR_ANGLES = [
   Math.PI / 8, Math.PI / 4, Math.PI * 3 / 8, Math.PI / 2,
 ];
 const STUCK_LIMIT = 120;
-const LAP_COMPLETION_PROGRESS = 1.0;
+const LAP_COMPLETION_PROGRESS = 0.995;
 
 class HeadlessCar {
   constructor(track, brain, teamIdx, speedMult) {
@@ -341,9 +228,15 @@ class HeadlessCar {
     this.score = 0;
     this.alive = true;
     this.finished = false;
+    this.killReason = 'active';
     this.frameCounter = 0;
     this.stuckFrames = 0;
     this.reverseAccum = 0;
+    this.wrongWayFrames = 0;
+    // Lap checkpoints — all must be passed before finish-line crossing counts.
+    this.passedQuarter = false;
+    this.passedHalf = false;
+    this.passedThreeQuarter = false;
   }
 
   update() {
@@ -368,6 +261,7 @@ class HeadlessCar {
     const midZ = (this.z + newZ) * 0.5;
     if (!this.track.isOnTrack(midX, midZ) || !this.track.isOnTrack(newX, newZ)) {
       this.alive = false;
+      this.killReason = 'offtrack';
       this.score = computeScore(this);
       return;
     }
@@ -377,8 +271,10 @@ class HeadlessCar {
 
     const { progress, idx } = this.track.getProgressLocal(this.x, this.z, this.lastProgressIdx);
     this.lastProgressIdx = idx;
-    let delta = progress - this.lastProgress;
-    if (delta < -0.5) delta += 1.0;
+    const rawDelta = progress - this.lastProgress;
+    let delta = rawDelta;
+    const crossedFinish = rawDelta < -0.5;
+    if (crossedFinish) delta += 1.0;
     if (delta > 0.5) delta -= 1.0;
 
     // Cap delta to prevent progress aliasing on overlapping track geometry
@@ -390,23 +286,54 @@ class HeadlessCar {
     this.lastProgress = progress;
     this.totalProgress = this.progressAccum;
 
-    if (this.stuckFrames > STUCK_LIMIT) { this.alive = false; return; }
+    if (this.stuckFrames > STUCK_LIMIT) { this.alive = false; this.killReason = 'stuck'; return; }
 
     // Reverse driving — kill within ~10 frames of wrong-way driving
-    if (this.reverseAccum < -0.05) { this.alive = false; return;
+    if (this.reverseAccum < -0.05) { this.alive = false; this.killReason = 'reverse'; return; }
+
+    // Wrong-way via velocity-tangent alignment — catches aliasing at overlaps
+    if (this.speed > 0.5) {
+      const tg = this.track.tangents[idx];
+      const dot = cosA * tg[0] + sinA * tg[1];
+      if (dot < -0.3) {
+        this.wrongWayFrames++;
+        if (this.wrongWayFrames > 5) { this.alive = false; this.killReason = 'wrong_way'; return; }
+      } else {
+        this.wrongWayFrames = 0;
+      }
     }
 
     // Scaled loitering detection
     if (this.frameCounter > 200 && this.progressAccum < this.frameCounter * 0.00015) {
       this.alive = false;
+      this.killReason = 'loitering';
       this.score = computeScore(this);
       return;
     }
 
     this.frameCounter++;
 
-    if (this.progressAccum >= LAP_COMPLETION_PROGRESS) {
+    // Ordered checkpoints — each must be passed before the next counts
+    if (!this.passedQuarter && progress >= 0.20 && progress <= 0.35) {
+      this.passedQuarter = true;
+    }
+    if (this.passedQuarter && !this.passedHalf && progress >= 0.45 && progress <= 0.60) {
+      this.passedHalf = true;
+    }
+    if (this.passedHalf && !this.passedThreeQuarter && progress >= 0.70 && progress <= 0.85) {
+      this.passedThreeQuarter = true;
+    }
+
+    // Lap completion requires ALL checkpoints + finish-line crossing (or
+    // accumulated progress reaching 1.0 AND all checkpoints visited)
+    const allCheckpointsHit =
+      this.passedQuarter && this.passedHalf && this.passedThreeQuarter;
+    const reachedTarget =
+      allCheckpointsHit && this.progressAccum >= LAP_COMPLETION_PROGRESS;
+    const crossedFinishLine = allCheckpointsHit && crossedFinish;
+    if (reachedTarget || crossedFinishLine) {
       this.finished = true;
+      this.killReason = 'finished';
       this.lapTime = this.frameCounter;
     }
 
@@ -425,18 +352,43 @@ function runGeneration(track, cars, timeout) {
     }
     if (!anyAlive) break;
   }
-  for (const c of cars) { if (c.alive && !c.finished) c.alive = false; }
+  for (const c of cars) {
+    if (c.alive && !c.finished) {
+      c.alive = false;
+      if (!c.killReason || c.killReason === 'active') c.killReason = 'timeout';
+    }
+  }
 }
 
 // ─── Evolution (uses shared evolution-core.js) ───────
-function evolve(sorted, numCars, baseMut, track, speedMult, doRestart, hallOfFameWeights) {
+// `level` is the current curriculum level — every cloned brain has its
+// active LoRA adapter switched to this level (and a fresh adapter created
+// if none exists yet). This is what enforces "freeze base, mutate current
+// adapter" inside NeuralCar.mutate().
+function evolve(sorted, numCars, baseMut, track, speedMult, doRestart, hallOfFameWeights, level) {
   const newCars = [];
+
+  // LoRA mode: freeze base at level >= 1 by collapsing all child bases to the
+  // champion's. Without this, tournament selection would scatter base
+  // diversity and we'd lose the lapping brain's exact base.
+  // --noLora mode: skip everything — base stays mutable (catastrophic
+  // forgetting baseline for A/B comparison).
+  const championBase = !NO_LORA && level >= 1 && hallOfFameWeights && hallOfFameWeights.base
+    ? hallOfFameWeights.base
+    : null;
+
+  const makeBrain = (weights) => {
+    const b = new NeuralCar(weights, { rank: LORA_RANK_OVERRIDE, softFreezeFactor: SOFT_FREEZE });
+    if (championBase) b.setBase(championBase);
+    if (!NO_LORA) b.setLevel(level);
+    return b;
+  };
 
   // Cars #0-1: preserve all-time champion + best current generation.
   const championWeights = hallOfFameWeights || sorted[0].brain.getWeights();
   const currentBestWeights = sorted[0].brain.getWeights();
-  newCars.push(new HeadlessCar(track, new NeuralCar(championWeights), 0, speedMult));
-  newCars.push(new HeadlessCar(track, new NeuralCar(currentBestWeights), 1, speedMult));
+  newCars.push(new HeadlessCar(track, makeBrain(championWeights), 0, speedMult));
+  newCars.push(new HeadlessCar(track, makeBrain(currentBestWeights), 1, speedMult));
 
   if (doRestart) {
     // Partial restart: keep top 20% micro-mutated, rest heavily mutated
@@ -444,13 +396,13 @@ function evolve(sorted, numCars, baseMut, track, speedMult, doRestart, hallOfFam
     // Use configured base mutation for parity with visual runtime.
     const eliteMutRate = MUTATION_RATE * 0.1;
     for (let i = 1; i < Math.min(eliteCount, numCars); i++) {
-      const elite = new NeuralCar(sorted[Math.min(i, sorted.length - 1)].brain.getWeights());
+      const elite = makeBrain(sorted[Math.min(i, sorted.length - 1)].brain.getWeights());
       elite.mutate(eliteMutRate);
       newCars.push(new HeadlessCar(track, elite, i, speedMult));
     }
     for (let i = newCars.length; i < numCars; i++) {
       const parent = sorted[Math.floor(Math.random() * eliteCount)];
-      const child = new NeuralCar(parent.brain.getWeights());
+      const child = makeBrain(parent.brain.getWeights());
       child.mutate(baseMut * 3.0);
       newCars.push(new HeadlessCar(track, child, i, speedMult));
     }
@@ -458,7 +410,7 @@ function evolve(sorted, numCars, baseMut, track, speedMult, doRestart, hallOfFam
     // Tournament selection + tiered mutation
     for (let i = newCars.length; i < numCars; i++) {
       const parent = tournamentSelect(sorted, 3);
-      const child = new NeuralCar(parent.brain.getWeights());
+      const child = makeBrain(parent.brain.getWeights());
       const mutRate = getTieredMutationRate(i, numCars, baseMut);
       child.mutate(mutRate);
       newCars.push(new HeadlessCar(track, child, i, speedMult));
@@ -471,23 +423,57 @@ function evolve(sorted, numCars, baseMut, track, speedMult, doRestart, hallOfFam
 }
 
 // ─── Main Training Loop ─────────────────────────────
-const { writeFileSync } = await import('fs');
+const { writeFileSync, mkdirSync } = await import('fs');
+const { dirname } = await import('path');
 
 console.log(`\n  F1 Neuroevolution — Headless Trainer v2`);
 console.log(`  ─────────────────────────────────────────`);
-console.log(`  Track:      ${TRACK_TYPE}`);
+console.log(`  Track:      ${TRACK_TYPE}${WIDTH_OVERRIDE != null ? ` (width override: ${WIDTH_OVERRIDE})` : ''}`);
 console.log(`  Cars:       ${NUM_CARS}`);
 console.log(`  Generations:${NUM_GENS}`);
 console.log(`  Mutation:   ${MUTATION_RATE}`);
 console.log(`  Timeout:    ${TIMEOUT} frames`);
 console.log(`  Speed mult: ${SPEED_MULT}x`);
 console.log(`  Output:     ${OUTPUT_FILE}`);
-console.log(`  Evolution:  tournament(k=3) + tiered mutation + curriculum learning\n`);
+console.log(`  Evolution:  tournament(k=3) + tiered mutation + curriculum learning`);
+console.log(`  LoRA:       ${NO_LORA ? 'OFF (catastrophic-forgetting baseline)' : `ON rank=${LORA_RANK_OVERRIDE}` + (SOFT_FREEZE > 0 ? ` softFreeze=${SOFT_FREEZE}` : ' (strict freeze)')}`);
+console.log(`  Two-phase:  ${TWO_PHASE ? `ON (slow ${SLOW_SPEED}x → fast ${SPEED_MULT}x per level)` : 'OFF'}\n`);
 
-let track = new HeadlessTrack(TRACK_TYPE);
+let track = new HeadlessTrack(TRACK_TYPE, WIDTH_OVERRIDE);
+
+// Optional warm-start from a saved brain. The first 2 cars are cloned from
+// the loaded weights (elite pair), the rest are random.
+let warmBrain = null;
+if (LOAD_FILE) {
+  const { readFileSync } = await import('fs');
+  warmBrain = JSON.parse(readFileSync(LOAD_FILE, 'utf-8'));
+  console.log(`  Warm-starting from: ${LOAD_FILE}\n`);
+}
+
+// Warm-start brain might already encode a higher level (saved from a
+// previous run that escalated). Honor its currentLevel so adapter mutability
+// matches the loaded state.
+let difficultyLevel = (warmBrain && Number.isFinite(warmBrain.currentLevel))
+  ? warmBrain.currentLevel
+  : 0;
+
+// Two-phase speed curriculum within each level. Phase 0 = slow (warmup),
+// phase 1 = full race speed. When TWO_PHASE is off, every gen runs at
+// SPEED_MULT (existing behavior).
+let currentPhase = TWO_PHASE ? 0 : 1;
+let currentSpeed = TWO_PHASE ? SLOW_SPEED : SPEED_MULT;
+
 let cars = [];
 for (let i = 0; i < NUM_CARS; i++) {
-  cars.push(new HeadlessCar(track, null, i, SPEED_MULT));
+  let b;
+  const opts = { rank: LORA_RANK_OVERRIDE, softFreezeFactor: SOFT_FREEZE };
+  if (warmBrain && i < 2) {
+    b = new NeuralCar(warmBrain, opts);
+  } else {
+    b = new NeuralCar(null, opts);
+  }
+  if (!NO_LORA) b.setLevel(difficultyLevel);
+  cars.push(new HeadlessCar(track, b, i, currentSpeed));
 }
 
 let allTimeBest = 0;
@@ -495,10 +481,13 @@ let bestLapTime = Infinity;
 let stagnantGens = 0;
 let currentMutation = MUTATION_RATE;
 let bestWeights = null;
-let difficultyLevel = 0;
 let bestLapStagnantGens = 0;
 let escalationGens = 0;
 let lapImprovementsOnLevel = 0;
+let plateauConsecutiveChecks = 0;
+let plateauAvgHistory = [];
+let plateauFinishedRateHistory = [];
+let escalationStatus = null;
 
 const t0 = performance.now();
 
@@ -510,9 +499,15 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
   const bestScore = cars[0].score;
   const avgProgress = cars.reduce((s, c) => s + c.totalProgress, 0) / cars.length;
   const finishers = cars.filter((c) => c.finished);
+  const bestCar = cars[0];
+  const finishedRate = finishers.length / Math.max(1, cars.length);
   const genBestLap = finishers.length > 0
     ? Math.min(...finishers.map((c) => c.lapTime))
     : Infinity;
+  plateauAvgHistory.push(avgProgress);
+  plateauFinishedRateHistory.push(finishedRate);
+  if (plateauAvgHistory.length > 160) plateauAvgHistory.shift();
+  if (plateauFinishedRateHistory.length > 160) plateauFinishedRateHistory.shift();
 
   if (genBestLap < bestLapTime) {
     bestLapTime = genBestLap;
@@ -521,6 +516,13 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
   } else if (bestLapTime < Infinity) {
     bestLapStagnantGens++;
   }
+
+  const plateauStatus = evaluatePlateauStatus({
+    avgProgressHistory: plateauAvgHistory,
+    finishedRateHistory: plateauFinishedRateHistory,
+    consecutiveChecks: plateauConsecutiveChecks,
+  });
+  plateauConsecutiveChecks = plateauStatus.consecutiveChecks || 0;
 
   // Adaptive mutation + curriculum escalation
   const mutState = computeAdaptiveMutation({
@@ -533,32 +535,72 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
     currentDifficultyLevel: difficultyLevel,
     escalationGens,
     lapImprovementsOnLevel,
+    hasCompletedLap: bestLapTime < Infinity,
+    plateauStatus,
   });
   escalationGens++;
   allTimeBest = mutState.allTimeBest;
   stagnantGens = mutState.stagnantGens;
   currentMutation = mutState.mutationRate;
+  escalationStatus = mutState.escalationStatus || null;
 
   if (!bestWeights || mutState.improved) {
     bestWeights = cars[0].brain.getWeights();
   }
 
-  // Curriculum escalation
-  if (mutState.escalate) {
-    difficultyLevel++;
-    const step = DIFFICULTY_LADDER[difficultyLevel];
-    const defaultWidth = TRACK_DEFAULT_WIDTHS[step.track];
-    const newWidth = step.widthDelta !== 0 ? defaultWidth + step.widthDelta : null;
-    track = new HeadlessTrack(step.track, newWidth);
-    bestLapTime = Infinity;
-    bestLapStagnantGens = 0;
-    stagnantGens = 0;
-    escalationGens = 0;
-    lapImprovementsOnLevel = 0;
-    allTimeBest = 0;
-    const widthNote = step.widthDelta !== 0 ? ` (width: ${defaultWidth + step.widthDelta})` : '';
-    console.log(`\n  >>> ESCALATION: Level ${difficultyLevel} -> ${step.track}${widthNote}`);
-    console.log(`  >>> Carrying over best brain weights (210 params)\n`);
+  // Curriculum escalation, with optional two-phase speed curriculum:
+  //   PHASE 0 (slow) plateaus → switch to PHASE 1 (fast) on SAME level
+  //   PHASE 1 (fast) plateaus → escalate to NEXT level (back to phase 0)
+  // Special case: at the MAX curriculum level, computeAdaptiveMutation()
+  // forces escalate=false (notMaxLevel guard). But we still want a phase
+  // transition from slow → fast at max level. Detect plateau directly.
+  const atMaxLevel = difficultyLevel >= DIFFICULTY_LADDER.length - 1;
+  const slowPhasePlateauedAtMax = TWO_PHASE
+    && currentPhase === 0
+    && atMaxLevel
+    && bestLapStagnantGens >= 80
+    && escalationGens >= 150;
+
+  if (mutState.escalate || slowPhasePlateauedAtMax) {
+    if (TWO_PHASE && currentPhase === 0) {
+      // Phase transition (same level, switch to fast speed). Adapter persists.
+      currentPhase = 1;
+      currentSpeed = SPEED_MULT;
+      bestLapTime = Infinity;
+      bestLapStagnantGens = 0;
+      stagnantGens = 0;
+      escalationGens = 0;
+      lapImprovementsOnLevel = 0;
+      plateauConsecutiveChecks = 0;
+      plateauAvgHistory = [];
+      plateauFinishedRateHistory = [];
+      escalationStatus = null;
+      allTimeBest = 0;
+      console.log(`\n  >>> PHASE TRANSITION: Level ${difficultyLevel} -> fast (${currentSpeed.toFixed(1)}x); same adapter, refining for race speed\n`);
+    } else {
+      // True escalation: next track + reset to slow phase (if two-phase)
+      difficultyLevel++;
+      const step = DIFFICULTY_LADDER[difficultyLevel];
+      const defaultWidth = TRACK_DEFAULT_WIDTHS[step.track];
+      const newWidth = step.widthDelta !== 0 ? defaultWidth + step.widthDelta : null;
+      track = new HeadlessTrack(step.track, newWidth);
+      bestLapTime = Infinity;
+      bestLapStagnantGens = 0;
+      stagnantGens = 0;
+      escalationGens = 0;
+      lapImprovementsOnLevel = 0;
+      plateauConsecutiveChecks = 0;
+      plateauAvgHistory = [];
+      plateauFinishedRateHistory = [];
+      escalationStatus = null;
+      allTimeBest = 0;
+      currentPhase = TWO_PHASE ? 0 : 1;
+      currentSpeed = TWO_PHASE ? SLOW_SPEED : SPEED_MULT;
+      const widthNote = step.widthDelta !== 0 ? ` (width: ${defaultWidth + step.widthDelta})` : '';
+      const speedNote = TWO_PHASE ? ` @ ${currentSpeed.toFixed(1)}x slow` : '';
+      console.log(`\n  >>> ESCALATION: Level ${difficultyLevel} -> ${step.track}${widthNote}${speedNote}`);
+      console.log(`  >>> Base frozen; new LoRA adapter (rank 2, ~88 params) added for this level\n`);
+    }
   }
 
   // Progress output
@@ -569,26 +611,34 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
   if (gen % 10 === 0 || gen === 1 || genBestLap < Infinity || mutState.restart) {
     const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
     const finStr = finishers.length > 0 ? ` fin:${finishers.length}` : '';
+    const plateauStr = escalationStatus
+      ? ` pl:${Math.round((escalationStatus.confidence || 0) * 100)
+        .toString()
+        .padStart(2)}% chk:${escalationStatus.consecutiveChecks || 0}/${escalationStatus.requiredChecks || 0}`
+      : '';
     console.log(
       `  Gen ${String(gen).padStart(4)} | ` +
       `score: ${bestScore.toFixed(2).padStart(8)} | ` +
       `avg: ${(avgProgress * 100).toFixed(1).padStart(5)}% | ` +
       `lap: ${lapStr.padStart(5)} | ` +
       `best: ${bestLapStr.padStart(5)} | ` +
-      `mut: ${currentMutation.toFixed(3)}${finStr}${restartTag} | ${elapsed}s`
+      `mut: ${currentMutation.toFixed(3)}${finStr}${plateauStr}${restartTag} | ${elapsed}s`
     );
   }
 
   // Reset stagnation counter after restart
   if (mutState.restart) stagnantGens = 0;
 
-  // Evolve next generation
+  // Evolve next generation — pass current curriculum level so LoRA adapters
+  // get switched/created and only the right parameters mutate. currentSpeed
+  // tracks the two-phase speed schedule (slow → fast within each level).
   if (gen < NUM_GENS) {
-    cars = evolve(cars, NUM_CARS, currentMutation, track, SPEED_MULT, mutState.restart, bestWeights);
+    cars = evolve(cars, NUM_CARS, currentMutation, track, currentSpeed, mutState.restart, bestWeights, difficultyLevel);
   }
 }
 
 // Save best brain
+mkdirSync(dirname(OUTPUT_FILE), { recursive: true });
 writeFileSync(OUTPUT_FILE, JSON.stringify(bestWeights, null, 2));
 const totalTime = ((performance.now() - t0) / 1000).toFixed(1);
 console.log(`\n  Done! ${NUM_GENS} generations in ${totalTime}s`);

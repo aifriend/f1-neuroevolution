@@ -2,6 +2,7 @@
 // Top-left: stats | Bottom-left: neural network | Bottom-right: lap graph
 
 import { NUM_SENSORS, NUM_INPUTS, HIDDEN_SIZE } from './nn.js';
+import { DIFFICULTY_LADDER } from './evolution-core.js?v=29';
 
 export class Hud {
   constructor(canvas) {
@@ -16,10 +17,13 @@ export class Hud {
 
   resize() {
     const dpr = window.devicePixelRatio || 1;
-    this.canvas.width = window.innerWidth * dpr;
-    this.canvas.height = window.innerHeight * dpr;
-    this.canvas.style.width = window.innerWidth + 'px';
-    this.canvas.style.height = window.innerHeight + 'px';
+    // Viewport may report 0 in hidden iframes; use fallback so canvas renders
+    const w = window.innerWidth || document.documentElement.clientWidth || 1024;
+    const h = window.innerHeight || document.documentElement.clientHeight || 768;
+    this.canvas.width = w * dpr;
+    this.canvas.height = h * dpr;
+    this.canvas.style.width = w + 'px';
+    this.canvas.style.height = h + 'px';
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     this.nnCanvas.width = this.canvas.width;
@@ -30,14 +34,82 @@ export class Hud {
 
   render(state) {
     const ctx = this.ctx;
-    const w = window.innerWidth;
-    const h = window.innerHeight;
+    const w = window.innerWidth || document.documentElement.clientWidth || 1024;
+    const h = window.innerHeight || document.documentElement.clientHeight || 768;
     ctx.clearRect(0, 0, w, h);
 
     this._drawStats(ctx, state, w);
+    this._drawCurriculum(ctx, state, w, h);
     this._drawNNLayer(state, w, h);
     ctx.drawImage(this.nnCanvas, 0, 0, w, h);
     this._drawLapGraph(ctx, state.lapHistory, w, h);
+  }
+
+  // ─── Curriculum Progress (shows all levels, current one highlighted) ─
+  _drawCurriculum(ctx, state, w, h) {
+    const x = 16, y = 184, panelW = 280, panelH = 92;
+    this._panel(ctx, x, y, panelW, panelH, 'Curriculum (LoRA adapters)');
+
+    const currentLevel = state._difficultyLevel || 0;
+    // Read adapter library off the elite brain to show what's been learned.
+    const elite = state.bestCar || state.cars && state.cars[0];
+    const adapters = (elite && elite.brain && elite.brain.adapters) || {};
+    const rank = (elite && elite.brain && elite.brain.rank) || 2;
+
+    const cellW = (panelW - 20) / DIFFICULTY_LADDER.length;
+    const cellH = 28;
+    const cellY = y + 30;
+
+    // Draw a cell per level
+    for (let i = 0; i < DIFFICULTY_LADDER.length; i++) {
+      const cx = x + 10 + i * cellW;
+      const isCurrent = i === currentLevel;
+      const hasAdapter = i === 0 || adapters[i] != null;
+
+      // Background fill
+      let fill = 'rgba(40,50,70,0.55)';
+      if (hasAdapter) fill = 'rgba(40,140,90,0.5)';      // mastered (or base)
+      if (isCurrent) fill = 'rgba(255,144,48,0.65)';     // currently training
+      ctx.fillStyle = fill;
+      roundRect(ctx, cx + 1, cellY, cellW - 2, cellH, 3);
+      ctx.fill();
+
+      // Border for current
+      if (isCurrent) {
+        ctx.strokeStyle = 'rgba(255,200,120,0.95)';
+        ctx.lineWidth = 1.5;
+        roundRect(ctx, cx + 1, cellY, cellW - 2, cellH, 3);
+        ctx.stroke();
+      }
+
+      // Level number
+      ctx.fillStyle = isCurrent ? 'rgba(255,255,255,0.95)' : 'rgba(200,220,240,0.75)';
+      ctx.font = 'bold 11px -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      ctx.fillText(`L${i}`, cx + cellW / 2, cellY + 4);
+
+      // Track abbrev
+      const tname = DIFFICULTY_LADDER[i].track;
+      const abbrev = tname === 'serpentine_bay' ? 'sBay'
+        : tname === 'silverstone' ? 'Slv'
+        : tname.slice(0, 3);
+      ctx.font = '8px -apple-system, sans-serif';
+      ctx.fillStyle = isCurrent ? 'rgba(255,255,255,0.85)' : 'rgba(150,180,210,0.6)';
+      ctx.fillText(abbrev, cx + cellW / 2, cellY + 16);
+    }
+
+    // Footer line: rank info + adapter count
+    const adapterCount = Object.keys(adapters).length;
+    ctx.fillStyle = 'rgba(150,180,210,0.6)';
+    ctx.font = '10px -apple-system, sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(
+      `rank ${rank}  ·  ${adapterCount} adapter${adapterCount === 1 ? '' : 's'} stored  ·  base frozen`,
+      x + 12, y + panelH - 14
+    );
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
   }
 
   _drawNNLayer(state, w, h) {
@@ -114,6 +186,26 @@ export class Hud {
     ctx.font = '11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
     ctx.fillText(`All-Time Best: ${state.allTimeBest.toFixed(1)}`, 20, 146);
 
+    // Curriculum progress (plateau-based escalation)
+    const level = state._difficultyLevel || 0;
+    if (level < DIFFICULTY_LADDER.length - 1) {
+      const esc = state._escalationStatus;
+      let status;
+      if (!esc) {
+        status = 'Next Lv: gathering plateau signal...';
+      } else if (esc.reason === 'waiting_for_lap') {
+        status = 'Next Lv: waiting for first valid lap';
+      } else {
+        const conf = Math.round((esc.confidence || 0) * 100);
+        const checksLeft = Math.max(0, esc.remainingChecks || 0);
+        status = `Next Lv: plateau ${conf}%  checks left ${checksLeft}`;
+      }
+
+      ctx.fillStyle = 'rgba(120,150,180,0.55)';
+      ctx.font = '11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+      ctx.fillText(status, 20, 162);
+    }
+
     // FPS (top-right)
     ctx.fillStyle = 'rgba(100,120,140,0.5)';
     ctx.font = '11px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
@@ -131,8 +223,18 @@ export class Hud {
     const sensors = nnCar.sensors;
     const bx = 16, by = Math.max(12, h - 340), bw = 280, bh = 324;
 
-    // Panel background
-    this._panel(ctx, bx, by, bw, bh, 'Neural Network');
+    // Panel background — show LoRA status in title
+    let title = 'Neural Network';
+    if (brain.currentLevel > 0 && brain.adapters && brain.adapters[brain.currentLevel]) {
+      title = `Neural Network · Lv${brain.currentLevel} adapter (rank ${brain.rank})`;
+    } else if (brain.currentLevel === 0) {
+      title = 'Neural Network · base only (Lv0)';
+    }
+    this._panel(ctx, bx, by, bw, bh, title);
+
+    // LoRA-aware weight access: render the currently-active effective
+    // weights (base + active adapter). NeuralCar always provides this.
+    const { w1, w2 } = brain._effectiveWeights();
 
     const padX = 38, padY = 30;
     const layerX = [bx + padX, bx + bw / 2, bx + bw - padX];
@@ -157,7 +259,7 @@ export class Hud {
     // Draw connections: input → hidden (only show strong ones to reduce clutter)
     for (let i = 0; i < NUM_INPUTS; i++) {
       for (let j = 0; j < HIDDEN_SIZE; j++) {
-        const w = brain.w1[i][j];
+        const w = w1[i][j];
         if (Math.abs(w) < 0.15) continue; // skip weak connections
         const alpha = Math.min(Math.abs(w) * 0.3, 0.7);
         ctx.strokeStyle = w > 0
@@ -174,7 +276,7 @@ export class Hud {
     // Draw connections: hidden → output
     for (let i = 0; i < HIDDEN_SIZE; i++) {
       for (let j = 0; j < 2; j++) {
-        const w = brain.w2[i][j];
+        const w = w2[i][j];
         if (Math.abs(w) < 0.1) continue;
         const alpha = Math.min(Math.abs(w) * 0.35, 0.85);
         ctx.strokeStyle = w > 0
@@ -242,14 +344,14 @@ export class Hud {
     ctx.textAlign = 'left';
   }
 
-  // ─── Lap Time Graph (left side, between stats and NN) ─────
+  // ─── Lap Time Graph (left side, between curriculum and NN) ─────
   _drawLapGraph(ctx, history, w, h) {
-    // Position between stats (ends ~y=160) and NN panel (starts ~y=h-340).
+    // Position between curriculum panel (ends ~y=276) and NN panel (starts y=h-340).
     // Dynamically compute available space to avoid overlap.
     const nnTop = h - 340;
-    const gh = Math.min(120, nnTop - 170);
-    const gw = 260;
-    const gx = 16, gy = Math.max(164, nnTop - gh - 6);
+    const gh = Math.min(120, nnTop - 290);
+    const gw = 280;
+    const gx = 16, gy = Math.max(284, nnTop - gh - 6);
     this._panel(ctx, gx, gy, gw, gh, 'Lap Time by Generation');
 
     if (history.length < 2) {

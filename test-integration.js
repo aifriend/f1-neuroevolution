@@ -426,8 +426,127 @@ assert(centerRay > 10, 'center sensor detects open track ahead', `ray = ${center
 const sideRay = testTrack.castRay(testTrack.startX, testTrack.startZ, testTrack.startAngle + Math.PI/2);
 assert(sideRay < centerRay, 'side sensor detects closer wall than forward');
 
-// ─── SUMMARY ────────────────────────────────────────
+// ─── 9. LoRA continual-learning mechanics ──────────
+// Verify the REAL nn.js (not the inlined NeuralCar above) preserves frozen
+// base + only mutates the active LoRA adapter.
 useRealRandom();
+console.log('\n  9. LoRA Continual Learning (real nn.js)');
+
+const { NeuralCar: RealNN, NUM_INPUTS: RNI, HIDDEN_SIZE: RHS, OUTPUT_SIZE: ROS, LORA_RANK: RLR } =
+  await import('./js/nn.js');
+const { validateBrainWeights: validateReal } = await import('./js/brain.js');
+
+// 9a — fresh brain has correct shape and no adapters
+const brain0 = new RealNN();
+assert(brain0.currentLevel === 0, 'fresh brain starts at level 0');
+assert(brain0.base.w1.length === RNI && brain0.base.w1[0].length === RHS, 'base.w1 has correct shape');
+assert(brain0.base.w2.length === RHS && brain0.base.w2[0].length === ROS, 'base.w2 has correct shape');
+assert(Object.keys(brain0.adapters).length === 0, 'fresh brain has no adapters');
+
+// 9b — setLevel(1) creates an adapter with correct shape
+brain0.setLevel(1);
+assert(brain0.currentLevel === 1, 'setLevel switches currentLevel');
+assert(brain0.adapters[1] != null, 'setLevel(1) creates adapter for level 1');
+const ad1 = brain0.adapters[1];
+assert(ad1.A1.length === RNI && ad1.A1[0].length === RLR, 'adapter A1 has shape (NUM_INPUTS, RANK)');
+assert(ad1.B1.length === RLR && ad1.B1[0].length === RHS, 'adapter B1 has shape (RANK, HIDDEN_SIZE)');
+
+// 9c — LoRA initialization invariant: B is zeros, so initial level-N forward
+//      pass equals level-0 forward pass (no behavior discontinuity at escalation)
+const brainA = new RealNN();
+const brainB = new RealNN(brainA.getWeights());
+brainB.setLevel(1);
+const inputs = new Array(RNI).fill(0).map(() => Math.random() * 2 - 1);
+const outA = brainA.think([...inputs]);
+const outB = brainB.think([...inputs]);
+assert(Math.abs(outA.steer - outB.steer) < 1e-9, 'level-1 brain with fresh adapter behaves identically to level-0 (LoRA-zero init)');
+assert(Math.abs(outA.gas - outB.gas) < 1e-9, 'level-1 brain with fresh adapter has identical gas output');
+
+// 9d — at level 0, mutate() changes base
+const brain_l0 = new RealNN();
+const baseW1Before = JSON.parse(JSON.stringify(brain_l0.base.w1));
+brain_l0.mutate(0.1);
+let baseChanged = false;
+for (let i = 0; i < RNI; i++) for (let j = 0; j < RHS; j++)
+  if (brain_l0.base.w1[i][j] !== baseW1Before[i][j]) { baseChanged = true; break; }
+assert(baseChanged, 'level-0 mutate() updates base weights');
+
+// 9e — at level 1, mutate() changes ONLY the adapter, NOT the base
+const brain_l1 = new RealNN();
+brain_l1.setLevel(1);
+const baseW1Frozen = JSON.parse(JSON.stringify(brain_l1.base.w1));
+const baseW2Frozen = JSON.parse(JSON.stringify(brain_l1.base.w2));
+const adapterB1Before = JSON.parse(JSON.stringify(brain_l1.adapters[1].B1));
+brain_l1.mutate(0.2);
+let baseTouched = false;
+for (let i = 0; i < RNI; i++) for (let j = 0; j < RHS; j++)
+  if (brain_l1.base.w1[i][j] !== baseW1Frozen[i][j]) { baseTouched = true; break; }
+for (let i = 0; i < RHS; i++) for (let j = 0; j < ROS; j++)
+  if (brain_l1.base.w2[i][j] !== baseW2Frozen[i][j]) { baseTouched = true; break; }
+assert(!baseTouched, 'level-1 mutate() does NOT touch the frozen base');
+
+let adapterChanged = false;
+for (let i = 0; i < RLR; i++) for (let j = 0; j < RHS; j++)
+  if (brain_l1.adapters[1].B1[i][j] !== adapterB1Before[i][j]) { adapterChanged = true; break; }
+assert(adapterChanged, 'level-1 mutate() updates the active adapter');
+
+// 9f — multiple adapters: only the CURRENT one mutates, others stay frozen
+const brain_l2 = new RealNN();
+brain_l2.setLevel(1);
+brain_l2.mutate(0.3); // train level 1 a bit
+const ad1Snapshot = JSON.parse(JSON.stringify(brain_l2.adapters[1]));
+brain_l2.setLevel(2); // escalate to level 2
+brain_l2.mutate(0.3);
+brain_l2.mutate(0.3);
+const ad1After = brain_l2.adapters[1];
+let level1AdapterTouched = false;
+for (let i = 0; i < RLR; i++) for (let j = 0; j < RHS; j++)
+  if (ad1After.B1[i][j] !== ad1Snapshot.B1[i][j]) { level1AdapterTouched = true; break; }
+assert(!level1AdapterTouched, 'training level 2 does NOT modify level-1 adapter (no forgetting)');
+assert(brain_l2.adapters[2] != null, 'escalating to level 2 creates a level-2 adapter');
+
+// 9g — getWeights() roundtrip preserves base + all adapters + currentLevel
+const brain_save = new RealNN();
+brain_save.setLevel(1);
+brain_save.mutate(0.1);
+brain_save.setLevel(2);
+brain_save.mutate(0.1);
+const saved = brain_save.getWeights();
+assert(saved.version === 2, 'getWeights returns v2 format');
+assert(saved.base != null && saved.adapters != null, 'saved brain has base and adapters');
+assert(Object.keys(saved.adapters).length === 2, 'saved brain has 2 adapters');
+assert(saved.currentLevel === 2, 'saved brain preserves currentLevel');
+
+const brain_loaded = new RealNN(saved);
+const reSaved = brain_loaded.getWeights();
+assert(JSON.stringify(reSaved.base) === JSON.stringify(saved.base), 'load/save roundtrip preserves base');
+assert(JSON.stringify(reSaved.adapters) === JSON.stringify(saved.adapters), 'load/save roundtrip preserves adapters');
+assert(reSaved.currentLevel === saved.currentLevel, 'load/save roundtrip preserves currentLevel');
+
+// 9h — switching back to a previously-trained level uses its frozen adapter
+brain_loaded.setLevel(1);
+const inputs2 = new Array(RNI).fill(0).map(() => Math.random() * 2 - 1);
+const out_l1_first = brain_loaded.think([...inputs2]);
+brain_loaded.setLevel(2);
+brain_loaded.setLevel(1);
+const out_l1_again = brain_loaded.think([...inputs2]);
+assert(Math.abs(out_l1_first.steer - out_l1_again.steer) < 1e-9,
+  'returning to a prior level reproduces its exact behavior (no forgetting verified)');
+
+// 9i — v1 (legacy) format still loads as base-only
+const legacyBrain = {
+  w1: Array.from({ length: RNI }, () => Array.from({ length: RHS }, () => 0.1)),
+  b1: Array.from({ length: RHS }, () => 0),
+  w2: Array.from({ length: RHS }, () => Array.from({ length: ROS }, () => 0.1)),
+  b2: Array.from({ length: ROS }, () => 0),
+};
+const legacyValid = validateReal(legacyBrain);
+assert(legacyValid.ok, 'v1 legacy brain validates ok');
+const legacyLoaded = new RealNN(legacyBrain);
+assert(legacyLoaded.currentLevel === 0, 'v1 legacy brain loads as level 0');
+assert(Object.keys(legacyLoaded.adapters).length === 0, 'v1 legacy brain has no adapters');
+
+// ─── SUMMARY ────────────────────────────────────────
 console.log('\n  ═══════════════════════════════════════');
 console.log(`  Results: ${passed}/${total} passed, ${failed} failed`);
 if (failed === 0) {
