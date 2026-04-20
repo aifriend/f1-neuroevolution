@@ -1,6 +1,6 @@
 import * as THREE from 'three';
-import { NeuralCar, F1_TEAMS } from './nn.js?v=5';
-import { computeScore } from './evolution-core.js?v=5';
+import { NeuralCar, F1_TEAMS } from './nn.js?v=29';
+import { computeScore } from './evolution-core.js?v=29';
 
 // 9 sensors spanning -90° to +90° in 22.5° increments (full forward hemisphere)
 const SENSOR_ANGLES = [
@@ -17,7 +17,10 @@ const SENSOR_ANGLES = [
 const SENSOR_LENGTH = 220;
 const CAR_LENGTH = 14;
 const STUCK_LIMIT = 120;
-const LAP_COMPLETION_PROGRESS = 1.0;
+const LAP_COMPLETION_PROGRESS = 0.995;
+const QUARTER_PROGRESS_MILESTONE = 0.25;
+const HALF_PROGRESS_MILESTONE = 0.50;
+const THREE_QUARTER_PROGRESS_MILESTONE = 0.75;
 
 export class Car {
   constructor(track, brain = null, teamIdx = 0, speedMult = 1) {
@@ -53,9 +56,17 @@ export class Car {
     this.score = 0;
     this.alive = true;
     this.finished = false;
+    this.killReason = 'active';
     this.frameCounter = 0;
     this.stuckFrames = 0;
     this.reverseAccum = 0; // sums negative progress deltas; kills car at -0.05
+    this.wrongWayFrames = 0; // counts consecutive frames car heads against centerline tangent
+    // Lap-validation checkpoints — car must hit ALL of these (in order) before
+    // the finish-line crossing counts as a lap. Stops cars that somehow wrap
+    // their progress index without actually driving the loop.
+    this.passedQuarter = false;   // progress ≈ 0.25
+    this.passedHalf = false;      // progress ≈ 0.50
+    this.passedThreeQuarter = false; // progress ≈ 0.75
 
     // 3D
     this.group = new THREE.Group();
@@ -96,6 +107,7 @@ export class Car {
     const midZ = (this.z + newZ) * 0.5;
     if (!this.track.isOnTrack(midX, midZ) || !this.track.isOnTrack(newX, newZ)) {
       this.alive = false;
+      this.killReason = 'offtrack';
       this._syncMesh();
       return;
     }
@@ -106,10 +118,13 @@ export class Car {
     // Progress tracking — local search prevents aliasing on figure-8 tracks
     const { progress, idx } = this.track.getProgressLocal(this.x, this.z, this.lastProgressIdx);
     this.lastProgressIdx = idx;
-    let delta = progress - this.lastProgress;
+    const rawDelta = progress - this.lastProgress;
+    let delta = rawDelta;
 
     // Handle wraparound (e.g., 0.99 → 0.01 = forward +0.02, not backward -0.98)
-    if (delta < -0.5) delta += 1.0;
+    // A wrap from high to low progress = car crossed the finish line.
+    const crossedFinish = rawDelta < -0.5; // big negative jump = forward wrap
+    if (crossedFinish) delta += 1.0;
     if (delta > 0.5) delta -= 1.0;
 
     // Cap delta to prevent progress aliasing on tracks with overlapping
@@ -133,6 +148,7 @@ export class Car {
     // Stuck detection
     if (this.stuckFrames > STUCK_LIMIT) {
       this.alive = false;
+      this.killReason = 'stuck';
       this._syncMesh();
       return;
     }
@@ -140,8 +156,30 @@ export class Car {
     // Reverse driving detection — kill within ~10 frames of wrong-way driving
     if (this.reverseAccum < -0.05) {
       this.alive = false;
+      this.killReason = 'reverse';
       this._syncMesh();
       return;
+    }
+
+    // Wrong-way detection via velocity-vs-tangent alignment.
+    // This catches cars driving against the intended track direction even
+    // in overlap regions where progress-delta can alias. If the angle between
+    // the car's heading and the local centerline tangent exceeds ~108°
+    // (dot product < -0.3), it's clearly going backwards along the track.
+    if (this.speed > 0.5) {
+      const tg = this.track.tangents[idx];
+      const dot = cosA * tg[0] + sinA * tg[1];
+      if (dot < -0.3) {
+        this.wrongWayFrames = (this.wrongWayFrames || 0) + 1;
+        if (this.wrongWayFrames > 5) {
+          this.alive = false;
+          this.killReason = 'wrong_way';
+          this._syncMesh();
+          return;
+        }
+      } else {
+        this.wrongWayFrames = 0;
+      }
     }
 
     // Scaled loitering detection: require minimum progress rate.
@@ -149,15 +187,37 @@ export class Car {
     // progress is killed early instead of wasting the entire timeout).
     if (this.frameCounter > 200 && this.progressAccum < this.frameCounter * 0.00015) {
       this.alive = false;
+      this.killReason = 'loitering';
       this._syncMesh();
       return;
     }
 
     this.frameCounter++;
 
-    // Lap completion
-    if (this.progressAccum >= LAP_COMPLETION_PROGRESS) {
+    // Update ordered checkpoints from accumulated forward distance.
+    // This is resilient to coarse per-frame progress sampling near threshold
+    // windows while still requiring substantial lap completion.
+    if (!this.passedQuarter && this.progressAccum >= QUARTER_PROGRESS_MILESTONE) {
+      this.passedQuarter = true;
+    }
+    if (this.passedQuarter && !this.passedHalf && this.progressAccum >= HALF_PROGRESS_MILESTONE) {
+      this.passedHalf = true;
+    }
+    if (this.passedHalf && !this.passedThreeQuarter && this.progressAccum >= THREE_QUARTER_PROGRESS_MILESTONE) {
+      this.passedThreeQuarter = true;
+    }
+
+    // Lap completion requires ALL checkpoints + finish-line crossing.
+    // Fallback: if pure centerline accumulation hits 1.0 (also requires
+    // checkpoints, so we can't be fooled by index wrapping).
+    const allCheckpointsHit =
+      this.passedQuarter && this.passedHalf && this.passedThreeQuarter;
+    const reachedTarget =
+      allCheckpointsHit && this.progressAccum >= LAP_COMPLETION_PROGRESS;
+    const crossedFinishLine = allCheckpointsHit && crossedFinish;
+    if (reachedTarget || crossedFinishLine) {
       this.finished = true;
+      this.killReason = 'finished';
       this.lapTime = this.frameCounter;
     }
 

@@ -14,11 +14,11 @@ describe('NeuralCar', () => {
   it('returns deep-copied weights', () => {
     const brain = new NeuralCar();
     const weights = brain.getWeights();
-    weights.w1[0][0] = 999;
-    weights.b1[0] = 999;
+    weights.base.w1[0][0] = 999;
+    weights.base.b1[0] = 999;
     const fresh = brain.getWeights();
-    expect(fresh.w1[0][0]).not.toBe(999);
-    expect(fresh.b1[0]).not.toBe(999);
+    expect(fresh.base.w1[0][0]).not.toBe(999);
+    expect(fresh.base.b1[0]).not.toBe(999);
   });
 
   it('keeps weights unchanged when mutation rate is zero', () => {
@@ -31,6 +31,8 @@ describe('NeuralCar', () => {
 
     const before = brain.getWeights();
     brain.mutate(0);
-    expect(brain.getWeights()).toEqual(before);
+    expect(brain.getWeights().base).toEqual(before.base);
+    expect(brain.getWeights().adapters).toEqual(before.adapters);
+    expect(brain.getWeights().currentLevel).toEqual(before.currentLevel);
   });
 });
