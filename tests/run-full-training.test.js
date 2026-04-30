@@ -11,12 +11,20 @@ import {
 } from '../scripts/run-full-training.js';
 
 describe('run-full-training config', () => {
-  it('parses defaults with twoPhase enabled', () => {
+  it('parses defaults with twoPhase + clone-test gating enabled', () => {
     const cfg = parseArgs([]);
     expect(cfg.track).toBe('monaco');
     expect(cfg.cars).toBe(80);
-    expect(cfg.gens).toBe(1000);
+    // 2000 gens is the post-clone-test budget for full 10-level mastery.
+    expect(cfg.gens).toBe(2000);
+    expect(cfg.timeout).toBe(4000);
     expect(cfg.twoPhase).toBe(true);
+    // Robustness gate + clone-test gating are ON by default.
+    expect(cfg.minFinisherRate).toBeCloseTo(0.10);
+    expect(cfg.robustWindow).toBe(20);
+    expect(cfg.cloneTestEvery).toBe(10);
+    expect(cfg.cloneTestCars).toBe(16);
+    expect(cfg.cloneTestK).toBe(3);
   });
 
   it('parses booleans and numeric overrides', () => {

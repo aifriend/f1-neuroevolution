@@ -18,9 +18,16 @@ function parseArgs(argv) {
   const out = {
     track: 'monaco',
     cars: 80,
-    gens: 1000,
+    // 2000 gens is the empirical budget for a full 10-level curriculum with
+    // clone-test gating ON: ~400 gens to find a lapping L0 brain, then ~150
+    // gens per validated level escalation. Bumped from the pre-clone-test
+    // default of 1000 (which got stuck at L5 in the failing v3 e2e run).
+    gens: 2000,
     mutation: 0.05,
-    timeout: 3500,
+    // 4000-frame timeout matches what the v8 silverstone/serpentine dwells
+    // used and clears even the longer ironcliff laps comfortably. Pre-v8
+    // default was 3500; clone-test runs benefit from the extra headroom.
+    timeout: 4000,
     speed: 1,
     slow: 0.5,
     rank: 2,
