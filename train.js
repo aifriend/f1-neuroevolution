@@ -4,7 +4,7 @@
 // Runs 1000x faster than visual mode. Outputs best brain as JSON.
 //
 // Usage:
-//   node train.js                          # defaults: monaco, 50 cars, 500 gens
+//   node train.js                          # defaults: monaco, 30 cars, 500 gens
 //   node train.js --track suzuka --cars 80 --gens 1000
 //   node train.js --output my-brain.json
 
@@ -50,6 +50,29 @@ const SOFT_FREEZE = parseFloat(flag('softFreeze', '0'));
 // curriculum level's geometry without going through escalation
 // (e.g. --track ironcliff --width 16 to dwell on level 9).
 const WIDTH_OVERRIDE = args.includes('--width') ? parseInt(flag('width'), 10) : null;
+// Override the starting curriculum level. By default we honor the loaded
+// brain's currentLevel; with --startLevel N we force it. Used for targeted
+// dwell training: load an L{K} checkpoint and dwell on level K+1 (the next
+// adapter to refine) without going through escalation first.
+const START_LEVEL_OVERRIDE = args.includes('--startLevel')
+  ? parseInt(flag('startLevel'), 10)
+  : null;
+// Escalation robustness gate: don't promote to the next track until this
+// fraction of cars in the latest generation is finishing laps. Prevents
+// "lucky elite" plateaus from advancing fragile adapters. 0 disables.
+const MIN_FINISHER_RATE_FOR_ESCALATION = parseFloat(flag('minFinisherRate', '0.10'));
+// Rolling window for robust-elite tracking: bestWeights becomes the brain
+// with the highest (finisherRate, bestScore) within the last N generations.
+const ROBUST_ELITE_WINDOW_SIZE = parseInt(flag('robustWindow', '20'), 10);
+// Clone-test elite gating. Every CLONE_TEST_EVERY gens we take the top-K
+// brains from the robust window, re-spawn each as N fresh cars on the
+// current track, and pick the one with the most finishers as the new
+// bestWeights. Closes the "single fastest brain has fragile spawn-position
+// generalization" gap (13/80 from a 71/80-population elite).
+//   --cloneTestEvery 0 disables.
+const CLONE_TEST_EVERY = parseInt(flag('cloneTestEvery', '10'), 10);
+const CLONE_TEST_CARS = parseInt(flag('cloneTestCars', '16'), 10);
+const CLONE_TEST_K = parseInt(flag('cloneTestK', '3'), 10);
 
 // ─── Import shared evolution + neural-network logic ──
 // Headless and visual trainers share the EXACT same NeuralCar (with LoRA
@@ -63,324 +86,39 @@ const {
   DIFFICULTY_LADDER,
   TRACK_DEFAULT_WIDTHS,
 } = await import('./js/evolution-core.js');
-const { computeInterpolationSteps } = await import('./js/track-geometry.js');
 const { NeuralCar, NUM_INPUTS, HIDDEN_SIZE } = await import('./js/nn.js');
-// Canonical curriculum track definitions (shared with js/track.js).
-// Drift between headless and visual physics is now architecturally impossible.
-const { TRACKS } = await import('./js/track-data.js');
-const NUM_SENSORS = 9;
+const { TRACK_IDS } = await import('./js/track-data.js');
+const { HeadlessTrack, HEADLESS_SENSOR_LENGTH, HEADLESS_LAP_COMPLETION_PROGRESS } = await import('./js/headless-track.js');
+// HeadlessCar + runGeneration come from a SHARED module (js/headless-car.js)
+// so cross-track-eval.js sees byte-identical physics. Eliminates the
+// "trains lap, eval doesn't" gap that plagued earlier dwell runs.
+const { HeadlessCar, runGeneration, SENSOR_ANGLES, NUM_SENSORS, STUCK_LIMIT } = await import('./js/headless-car.js');
 
-// ─── Track Physics (from track.js, no Three.js) ──────
-const SENSOR_LENGTH = 220;
-
-class HeadlessTrack {
-  constructor(type, widthOverride = null) {
-    const cfg = TRACKS[type] || TRACKS.monaco;
-    this.name = cfg.name;
-    this.trackWidth = widthOverride !== null ? widthOverride : cfg.width;
-    this.gridSize = 5;
-    const stepsPerSeg = computeInterpolationSteps(cfg.points, this.gridSize * 0.8);
-    this.points = this._interpolate(cfg.points, stepsPerSeg);
-    this.tangents = this._computeTangents();
-
-    const sp = this.points[0];
-    const st = this.tangents[0];
-    this.startX = sp[0];
-    this.startZ = sp[1];
-    this.startAngle = Math.atan2(st[1], st[0]);
-
-    this.grid = {};
-    this._buildGrid();
-  }
-
-  _interpolate(pts, steps) {
-    const result = [];
-    const n = pts.length;
-    for (let i = 0; i < n; i++) {
-      const p0 = pts[(i - 1 + n) % n];
-      const p1 = pts[i];
-      const p2 = pts[(i + 1) % n];
-      const p3 = pts[(i + 2) % n];
-      for (let s = 0; s < steps; s++) {
-        const t = s / steps;
-        const t2 = t * t, t3 = t2 * t;
-        const c0 = -0.5 * t3 + t2 - 0.5 * t;
-        const c1 = 1.5 * t3 - 2.5 * t2 + 1;
-        const c2 = -1.5 * t3 + 2 * t2 + 0.5 * t;
-        const c3 = 0.5 * t3 - 0.5 * t2;
-        result.push([
-          c0 * p0[0] + c1 * p1[0] + c2 * p2[0] + c3 * p3[0],
-          c0 * p0[1] + c1 * p1[1] + c2 * p2[1] + c3 * p3[1],
-        ]);
-      }
-    }
-    return result;
-  }
-
-  _computeTangents() {
-    const n = this.points.length;
-    const tangents = [];
-    for (let i = 0; i < n; i++) {
-      const next = this.points[(i + 1) % n];
-      const curr = this.points[i];
-      const dx = next[0] - curr[0], dz = next[1] - curr[1];
-      const len = Math.sqrt(dx * dx + dz * dz) || 1;
-      tangents.push([dx / len, dz / len]);
-    }
-    return tangents;
-  }
-
-  _buildGrid() {
-    const n = this.points.length;
-    const gs = this.gridSize;
-    const hw = this.trackWidth;
-    for (let i = 0; i < n; i++) {
-      const px = this.points[i][0], pz = this.points[i][1];
-      const t = this.tangents[i];
-      const nx = -t[1], nz = t[0];
-      for (let w = -hw; w <= hw; w += 1) {
-        const gx = Math.floor((px + nx * w) / gs);
-        const gz = Math.floor((pz + nz * w) / gs);
-        this.grid[gx + ',' + gz] = true;
-      }
-    }
-  }
-
-  isOnTrack(x, z) {
-    return this.grid[Math.floor(x / this.gridSize) + ',' + Math.floor(z / this.gridSize)] === true;
-  }
-
-  castRay(x, z, angle) {
-    const cosA = Math.cos(angle), sinA = Math.sin(angle);
-    for (let d = 2; d < SENSOR_LENGTH; d += 2) {
-      if (!this.isOnTrack(x + cosA * d, z + sinA * d)) return d;
-    }
-    return SENSOR_LENGTH;
-  }
-
-  getProgress(x, z) {
-    let minDist = Infinity, bestIdx = 0;
-    const n = this.points.length;
-    for (let i = 0; i < n; i += 4) {
-      const dx = x - this.points[i][0], dz = z - this.points[i][1];
-      const dist = dx * dx + dz * dz;
-      if (dist < minDist) { minDist = dist; bestIdx = i; }
-    }
-    for (let offset = -6; offset <= 6; offset++) {
-      const i = ((bestIdx + offset) % n + n) % n;
-      const dx = x - this.points[i][0], dz = z - this.points[i][1];
-      const dist = dx * dx + dz * dz;
-      if (dist < minDist) { minDist = dist; bestIdx = i; }
-    }
-    return bestIdx / n;
-  }
-
-  getProgressLocal(x, z, hintIdx, searchRadius = 20) {
-    let minDist = Infinity, bestIdx = hintIdx;
-    const n = this.points.length;
-    for (let offset = -searchRadius; offset <= searchRadius; offset++) {
-      const i = ((hintIdx + offset) % n + n) % n;
-      const dx = x - this.points[i][0], dz = z - this.points[i][1];
-      const dist = dx * dx + dz * dz;
-      if (dist < minDist) { minDist = dist; bestIdx = i; }
-    }
-    return { progress: bestIdx / n, idx: bestIdx };
-  }
-
-  getStartPos() {
-    return { x: this.startX, z: this.startZ, angle: this.startAngle };
-  }
-}
-
-// ─── Car Physics (from car.js, no Three.js) ──────────
-const SENSOR_ANGLES = [
-  -Math.PI / 2, -Math.PI * 3 / 8, -Math.PI / 4, -Math.PI / 8,
-  0,
-  Math.PI / 8, Math.PI / 4, Math.PI * 3 / 8, Math.PI / 2,
-];
-const STUCK_LIMIT = 120;
-const LAP_COMPLETION_PROGRESS = 0.995;
-
-class HeadlessCar {
-  constructor(track, brain, teamIdx, speedMult) {
-    this.track = track;
-    this.brain = brain || new NeuralCar();
-    this.speedMult = speedMult;
-
-    const start = track.getStartPos();
-    const t = track.tangents[0];
-    const nx = -t[1], nz = t[0];
-    const row = Math.floor(teamIdx / 2);
-    const col = (teamIdx % 2) - 0.5;
-
-    this.x = start.x - t[0] * row * 4 + nx * col * 8;
-    this.z = start.z - t[1] * row * 4 + nz * col * 8;
-    this.angle = start.angle;
-    this.speed = 0;
-    this.sensors = new Array(SENSOR_ANGLES.length).fill(0);
-    this.lapTime = 0;
-    this.totalProgress = 0;
-    const initProg = track.getProgress(this.x, this.z);
-    this.initialProgress = initProg;
-    this.lastProgress = initProg;
-    this.lastProgressIdx = Math.round(initProg * track.points.length);
-    this.progressAccum = 0;
-    this.score = 0;
-    this.alive = true;
-    this.finished = false;
-    this.killReason = 'active';
-    this.frameCounter = 0;
-    this.stuckFrames = 0;
-    this.reverseAccum = 0;
-    this.wrongWayFrames = 0;
-    // Lap checkpoints — all must be passed before finish-line crossing counts.
-    this.passedQuarter = false;
-    this.passedHalf = false;
-    this.passedThreeQuarter = false;
-  }
-
-  update() {
-    if (!this.alive || this.finished) return;
-
-    for (let i = 0; i < SENSOR_ANGLES.length; i++) {
-      this.sensors[i] = this.track.castRay(this.x, this.z, this.angle + SENSOR_ANGLES[i]) / SENSOR_LENGTH;
-    }
-
-    const inputs = [...this.sensors, this.speed / 8.1];
-    const decision = this.brain.think(inputs);
-    this.angle += decision.steer * 0.08;
-    this.speed = (2.5 + (decision.gas + 1) * 2.8) * this.speedMult;
-
-    const cosA = Math.cos(this.angle);
-    const sinA = Math.sin(this.angle);
-    const newX = this.x + cosA * this.speed;
-    const newZ = this.z + sinA * this.speed;
-
-    // Midpoint collision to prevent wall tunneling at high speeds
-    const midX = (this.x + newX) * 0.5;
-    const midZ = (this.z + newZ) * 0.5;
-    if (!this.track.isOnTrack(midX, midZ) || !this.track.isOnTrack(newX, newZ)) {
-      this.alive = false;
-      this.killReason = 'offtrack';
-      this.score = computeScore(this);
-      return;
-    }
-
-    this.x = newX;
-    this.z = newZ;
-
-    const { progress, idx } = this.track.getProgressLocal(this.x, this.z, this.lastProgressIdx);
-    this.lastProgressIdx = idx;
-    const rawDelta = progress - this.lastProgress;
-    let delta = rawDelta;
-    const crossedFinish = rawDelta < -0.5;
-    if (crossedFinish) delta += 1.0;
-    if (delta > 0.5) delta -= 1.0;
-
-    // Cap delta to prevent progress aliasing on overlapping track geometry
-    if (delta > 0.05) delta = 0.05;
-    if (delta < -0.05) delta = -0.05;
-
-    if (delta > 0) { this.progressAccum += delta; this.stuckFrames = 0; this.reverseAccum = 0; }
-    else { this.stuckFrames++; this.reverseAccum += delta; }
-    this.lastProgress = progress;
-    this.totalProgress = this.progressAccum;
-
-    if (this.stuckFrames > STUCK_LIMIT) { this.alive = false; this.killReason = 'stuck'; return; }
-
-    // Reverse driving — kill within ~10 frames of wrong-way driving
-    if (this.reverseAccum < -0.05) { this.alive = false; this.killReason = 'reverse'; return; }
-
-    // Wrong-way via velocity-tangent alignment — catches aliasing at overlaps
-    if (this.speed > 0.5) {
-      const tg = this.track.tangents[idx];
-      const dot = cosA * tg[0] + sinA * tg[1];
-      if (dot < -0.3) {
-        this.wrongWayFrames++;
-        if (this.wrongWayFrames > 5) { this.alive = false; this.killReason = 'wrong_way'; return; }
-      } else {
-        this.wrongWayFrames = 0;
-      }
-    }
-
-    // Scaled loitering detection
-    if (this.frameCounter > 200 && this.progressAccum < this.frameCounter * 0.00015) {
-      this.alive = false;
-      this.killReason = 'loitering';
-      this.score = computeScore(this);
-      return;
-    }
-
-    this.frameCounter++;
-
-    // Ordered checkpoints — each must be passed before the next counts
-    if (!this.passedQuarter && progress >= 0.20 && progress <= 0.35) {
-      this.passedQuarter = true;
-    }
-    if (this.passedQuarter && !this.passedHalf && progress >= 0.45 && progress <= 0.60) {
-      this.passedHalf = true;
-    }
-    if (this.passedHalf && !this.passedThreeQuarter && progress >= 0.70 && progress <= 0.85) {
-      this.passedThreeQuarter = true;
-    }
-
-    // Lap completion requires ALL checkpoints + finish-line crossing (or
-    // accumulated progress reaching 1.0 AND all checkpoints visited)
-    const allCheckpointsHit =
-      this.passedQuarter && this.passedHalf && this.passedThreeQuarter;
-    const reachedTarget =
-      allCheckpointsHit && this.progressAccum >= LAP_COMPLETION_PROGRESS;
-    const crossedFinishLine = allCheckpointsHit && crossedFinish;
-    if (reachedTarget || crossedFinishLine) {
-      this.finished = true;
-      this.killReason = 'finished';
-      this.lapTime = this.frameCounter;
-    }
-
-    // Use shared scoring function (same as visual frontend)
-    this.score = computeScore(this);
-  }
-}
-
-// ─── Generation Runner ──────────────────────────────
-function runGeneration(track, cars, timeout) {
-  for (let frame = 0; frame < timeout; frame++) {
-    let anyAlive = false;
-    for (const car of cars) {
-      car.update();
-      if (car.alive && !car.finished) anyAlive = true;
-    }
-    if (!anyAlive) break;
-  }
-  for (const c of cars) {
-    if (c.alive && !c.finished) {
-      c.alive = false;
-      if (!c.killReason || c.killReason === 'active') c.killReason = 'timeout';
-    }
-  }
-}
-
-// ─── Evolution (uses shared evolution-core.js) ───────
-// `level` is the current curriculum level — every cloned brain has its
-// active LoRA adapter switched to this level (and a fresh adapter created
-// if none exists yet). This is what enforces "freeze base, mutate current
 // adapter" inside NeuralCar.mutate().
 function evolve(sorted, numCars, baseMut, track, speedMult, doRestart, hallOfFameWeights, level) {
   const newCars = [];
 
-  // LoRA mode: freeze base at level >= 1 by collapsing all child bases to the
-  // champion's. Without this, tournament selection would scatter base
-  // diversity and we'd lose the lapping brain's exact base.
-  // --noLora mode: skip everything — base stays mutable (catastrophic
-  // forgetting baseline for A/B comparison).
+  // LoRA mode: freeze base + ALL prior-level adapters by collapsing every
+  // child to the champion's versions. Without this, tournament selection
+  // (parents come from the previous gen's mixed elite/random population)
+  // scatters base + adapter diversity, and a lucky child whose ancestry
+  // skipped some prior level can win bestWeights — silently dropping
+  // mastery on every level its lineage didn't carry.
+  // --noLora mode: skip everything — base stays mutable (forgetting baseline).
   const championBase = !NO_LORA && level >= 1 && hallOfFameWeights && hallOfFameWeights.base
     ? hallOfFameWeights.base
+    : null;
+  const championAdapters = !NO_LORA && level >= 1 && hallOfFameWeights && hallOfFameWeights.adapters
+    ? hallOfFameWeights.adapters
     : null;
 
   const makeBrain = (weights) => {
     const b = new NeuralCar(weights, { rank: LORA_RANK_OVERRIDE, softFreezeFactor: SOFT_FREEZE });
     if (championBase) b.setBase(championBase);
     if (!NO_LORA) b.setLevel(level);
+    // setPriorAdapters AFTER setLevel so currentLevel is set; setPriorAdapters
+    // skips currentLevel's adapter (preserves evolutionary search there).
+    if (championAdapters) b.setPriorAdapters(championAdapters);
     return b;
   };
 
@@ -426,6 +164,27 @@ function evolve(sorted, numCars, baseMut, track, speedMult, doRestart, hallOfFam
 const { writeFileSync, mkdirSync } = await import('fs');
 const { dirname } = await import('path');
 
+// Per-level checkpoints: at every escalation we snapshot the just-mastered
+// brain to OUTPUT_FILE with a "-Lv{N}" suffix. Lets you replay any earlier
+// curriculum state if a later level destabilizes the run.
+function checkpointPathForLevel(outputPath, level) {
+  if (outputPath.endsWith('.json')) {
+    return outputPath.replace(/\.json$/, `-L${level}.json`);
+  }
+  return `${outputPath}-L${level}.json`;
+}
+function saveLevelCheckpoint(level, weights) {
+  if (!weights) return;
+  const path = checkpointPathForLevel(OUTPUT_FILE, level);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify(weights, null, 2));
+    console.log(`  >>> CHECKPOINT saved: L${level} → ${path}`);
+  } catch (e) {
+    console.warn(`  >>> CHECKPOINT failed for L${level}: ${e.message}`);
+  }
+}
+
 console.log(`\n  F1 Neuroevolution — Headless Trainer v2`);
 console.log(`  ─────────────────────────────────────────`);
 console.log(`  Track:      ${TRACK_TYPE}${WIDTH_OVERRIDE != null ? ` (width override: ${WIDTH_OVERRIDE})` : ''}`);
@@ -452,10 +211,18 @@ if (LOAD_FILE) {
 
 // Warm-start brain might already encode a higher level (saved from a
 // previous run that escalated). Honor its currentLevel so adapter mutability
-// matches the loaded state.
-let difficultyLevel = (warmBrain && Number.isFinite(warmBrain.currentLevel))
-  ? warmBrain.currentLevel
-  : 0;
+// matches the loaded state — unless --startLevel was passed explicitly.
+let difficultyLevel;
+if (Number.isFinite(START_LEVEL_OVERRIDE)) {
+  difficultyLevel = START_LEVEL_OVERRIDE;
+} else if (warmBrain && Number.isFinite(warmBrain.currentLevel)) {
+  difficultyLevel = warmBrain.currentLevel;
+} else {
+  difficultyLevel = 0;
+}
+if (Number.isFinite(START_LEVEL_OVERRIDE)) {
+  console.log(`  --startLevel override: training adapter[${START_LEVEL_OVERRIDE}]`);
+}
 
 // Two-phase speed curriculum within each level. Phase 0 = slow (warmup),
 // phase 1 = full race speed. When TWO_PHASE is off, every gen runs at
@@ -467,7 +234,11 @@ let cars = [];
 for (let i = 0; i < NUM_CARS; i++) {
   let b;
   const opts = { rank: LORA_RANK_OVERRIDE, softFreezeFactor: SOFT_FREEZE };
-  if (warmBrain && i < 2) {
+  // Warm-load mode: ALL initial cars clone the warm brain so every child
+  // starts with the correct frozen base + frozen prior adapters. Diversity
+  // comes from per-car mutation of adapter[currentLevel], not from random
+  // base/adapter init that destroys mastery on prior levels.
+  if (warmBrain) {
     b = new NeuralCar(warmBrain, opts);
   } else {
     b = new NeuralCar(null, opts);
@@ -480,7 +251,21 @@ let allTimeBest = 0;
 let bestLapTime = Infinity;
 let stagnantGens = 0;
 let currentMutation = MUTATION_RATE;
-let bestWeights = null;
+// Seed bestWeights from the warm-loaded brain so championBase always
+// inherits the carefully-trained base from gen 1. Without this, a random
+// gen-1 elite could overwrite bestWeights with a random base, destroying
+// every prior level's mastery (the base-drift bug seen in dwell runs).
+let bestWeights = warmBrain
+  ? JSON.parse(JSON.stringify(warmBrain))
+  : null;
+// Rolling window of recent gens' elites for robust-elite selection. Each
+// entry: { finisherRate, bestScore, weights }. Cleared on escalation so the
+// new level builds its own robustness statistics.
+let robustEliteWindow = [];
+// Clone-test ratchet: tracks the clone-test stats of the brain currently
+// in bestWeights, so subsequent clone-tests can only IMPROVE it (not
+// regress to a faster-but-fragile strategy). Cleared on escalation.
+let bestWeightsCloneStats = null;
 let bestLapStagnantGens = 0;
 let escalationGens = 0;
 let lapImprovementsOnLevel = 0;
@@ -537,6 +322,10 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
     lapImprovementsOnLevel,
     hasCompletedLap: bestLapTime < Infinity,
     plateauStatus,
+    // Robustness gate: refuse to escalate while only a "lucky elite"
+    // 1-3/N cars are lapping. Adapter must be broadly capable first.
+    currentFinisherRate: finishedRate,
+    minFinisherRateForEscalation: MIN_FINISHER_RATE_FOR_ESCALATION,
   });
   escalationGens++;
   allTimeBest = mutState.allTimeBest;
@@ -544,8 +333,110 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
   currentMutation = mutState.mutationRate;
   escalationStatus = mutState.escalationStatus || null;
 
-  if (!bestWeights || mutState.improved) {
-    bestWeights = cars[0].brain.getWeights();
+  // Robust-elite tracking: bestWeights captures the brain that has the
+  // best ROLLING-WINDOW finisher rate (not just the single fastest car).
+  // This stores a brain that finishes consistently across many spawn
+  // positions, which is what we want to ship to the next level.
+  robustEliteWindow.push({
+    finisherRate: finishedRate,
+    bestScore,
+    weights: bestCar.brain.getWeights(),
+  });
+  if (robustEliteWindow.length > ROBUST_ELITE_WINDOW_SIZE) robustEliteWindow.shift();
+  // Choose elite by (finisherRate, then bestScore) lexicographic max.
+  const robustElite = robustEliteWindow.reduce((best, cur) => {
+    if (!best) return cur;
+    if (cur.finisherRate > best.finisherRate) return cur;
+    if (cur.finisherRate === best.finisherRate && cur.bestScore > best.bestScore) return cur;
+    return best;
+  }, null);
+
+  // Only replace bestWeights when the new candidate is actually lapping
+  // (finisherRate > 0). Otherwise a random gen-1 elite with no laps would
+  // overwrite a warm-loaded brain that's already known-good — destroying
+  // the carefully-trained base and prior adapters.
+  // ALSO: when clone-test gating is active, the per-gen update is suppressed
+  // once we have a clone-tested bestWeights so it can't get clobbered by
+  // an un-tested brain that won the per-gen sort by raw lap-time alone.
+  const candidate = robustElite ? robustElite.weights : cars[0].brain.getWeights();
+  const candidateLaps = robustElite ? robustElite.finisherRate > 0 : false;
+  const cloneTestActive = CLONE_TEST_EVERY > 0 && CLONE_TEST_K > 0 && CLONE_TEST_CARS > 0;
+  if (!bestWeights) {
+    bestWeights = candidate;
+  } else if (!cloneTestActive && mutState.improved && candidateLaps) {
+    // Without clone-test gating, fall back to per-gen elite update.
+    bestWeights = candidate;
+  }
+  // (When clone-test is active, the periodic clone-test block below is the
+  //  ONLY path that updates bestWeights — guarantees the saved brain has
+  //  passed a fresh-clone robustness check.)
+
+  // ─── Clone-test elite gating ──────────────────────────────
+  // Every CLONE_TEST_EVERY gens, take the top-K candidates from the rolling
+  // window and re-spawn each as N fresh-clone cars on the current track.
+  // Pick the one with the most finishers (tiebreak: highest avg score).
+  // This catches the "single fastest brain has fragile spawn-position
+  // generalization" gap — the saved brain must lap from many spawn rows,
+  // not just the row that happened to be fastest in some gen.
+  if (
+    CLONE_TEST_EVERY > 0
+    && CLONE_TEST_K > 0
+    && CLONE_TEST_CARS > 0
+    && gen % CLONE_TEST_EVERY === 0
+    && robustEliteWindow.length >= 1
+  ) {
+    const topK = [...robustEliteWindow]
+      .filter((e) => e.finisherRate > 0) // only test candidates that lapped
+      .sort((a, b) => {
+        if (b.finisherRate !== a.finisherRate) return b.finisherRate - a.finisherRate;
+        return b.bestScore - a.bestScore;
+      })
+      .slice(0, CLONE_TEST_K);
+    if (topK.length > 0) {
+      let winner = null;
+      for (const cand of topK) {
+        const cars2 = [];
+        for (let i = 0; i < CLONE_TEST_CARS; i++) {
+          const b = new NeuralCar(cand.weights, { rank: LORA_RANK_OVERRIDE });
+          if (!NO_LORA) b.setLevel(difficultyLevel);
+          cars2.push(new HeadlessCar(track, b, i, currentSpeed));
+        }
+        runGeneration(track, cars2, TIMEOUT);
+        const fin = cars2.filter((c) => c.finished).length;
+        const avg = cars2.reduce((s, c) => s + c.score, 0) / Math.max(1, cars2.length);
+        if (
+          !winner
+          || fin > winner.fin
+          || (fin === winner.fin && avg > winner.avg)
+        ) {
+          winner = { fin, avg, weights: cand.weights };
+        }
+      }
+      if (winner && winner.fin > 0) {
+        // RATCHET: only replace bestWeights when the new winner is at least
+        // as robust (more finishers, or equal finishers with better avg
+        // score). Otherwise a faster-but-less-robust strategy could erase
+        // a previously-validated 16/16 winner. Tracking via bestWeightsCloneStats.
+        if (
+          !bestWeightsCloneStats
+          || winner.fin > bestWeightsCloneStats.fin
+          || (winner.fin === bestWeightsCloneStats.fin
+              && winner.avg > bestWeightsCloneStats.avg)
+        ) {
+          bestWeights = winner.weights;
+          bestWeightsCloneStats = { fin: winner.fin, avg: winner.avg };
+          if (gen % (CLONE_TEST_EVERY * 5) === 0 || winner.fin === CLONE_TEST_CARS) {
+            console.log(
+              `  >>> CLONE-TEST gen ${gen}: ${topK.length} candidates, winner ${winner.fin}/${CLONE_TEST_CARS} fin avg ${winner.avg.toFixed(0)} (UPDATED)`
+            );
+          }
+        } else if (gen % (CLONE_TEST_EVERY * 10) === 0) {
+          console.log(
+            `  >>> CLONE-TEST gen ${gen}: ${winner.fin}/${CLONE_TEST_CARS} avg ${winner.avg.toFixed(0)} — kept ${bestWeightsCloneStats.fin}/${CLONE_TEST_CARS} avg ${bestWeightsCloneStats.avg.toFixed(0)}`
+          );
+        }
+      }
+    }
   }
 
   // Curriculum escalation, with optional two-phase speed curriculum:
@@ -561,7 +452,18 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
     && bestLapStagnantGens >= 80
     && escalationGens >= 150;
 
-  if (mutState.escalate || slowPhasePlateauedAtMax) {
+  // Clone-test escalation gate: when clone-test is active, refuse to
+  // escalate or phase-transition until bestWeights has been validated at
+  // the CURRENT phase by passing a clone-test with at least 75% finishers.
+  // Without this gate, mutState.escalate can fire on population-wide
+  // plateau (e.g. fin:20/80 at fast phase) while bestWeights is still the
+  // slow-phase 16/16 winner — and the saved checkpoint fails at fast speed.
+  const cloneTestThresholdFin = Math.max(1, Math.floor(CLONE_TEST_CARS * 0.75));
+  const cloneTestValidatedAtCurrentPhase =
+    !cloneTestActive
+    || (bestWeightsCloneStats && bestWeightsCloneStats.fin >= cloneTestThresholdFin);
+
+  if ((mutState.escalate || slowPhasePlateauedAtMax) && cloneTestValidatedAtCurrentPhase) {
     if (TWO_PHASE && currentPhase === 0) {
       // Phase transition (same level, switch to fast speed). Adapter persists.
       currentPhase = 1;
@@ -576,9 +478,21 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
       plateauFinishedRateHistory = [];
       escalationStatus = null;
       allTimeBest = 0;
-      console.log(`\n  >>> PHASE TRANSITION: Level ${difficultyLevel} -> fast (${currentSpeed.toFixed(1)}x); same adapter, refining for race speed\n`);
+      // CRITICAL: reset robust window + clone-test ratchet at phase transition.
+      // Slow-phase brains often lap 16/16 at 0.5x but 0/16 at 1.0x. Without
+      // this reset, the ratchet locks in slow-phase 16/16 as the bar, then
+      // every fast-phase candidate (who legitimately laps at 1.0x but might
+      // only achieve 12/16 in clone-test) gets rejected as "less robust" —
+      // and the saved checkpoint is the slow-phase-only brain that fails
+      // at race speed in eval. Reset clears the bar so fast-phase can win.
+      robustEliteWindow = [];
+      bestWeightsCloneStats = null;
+      console.log(`\n  >>> PHASE TRANSITION: Level ${difficultyLevel} -> fast (${currentSpeed.toFixed(1)}x); ratchet reset, refining for race speed\n`);
     } else {
-      // True escalation: next track + reset to slow phase (if two-phase)
+      // True escalation: SNAPSHOT the just-mastered level's brain BEFORE any
+      // state changes. The saved file is a fully-loadable v2 brain.
+      saveLevelCheckpoint(difficultyLevel, bestWeights);
+
       difficultyLevel++;
       const step = DIFFICULTY_LADDER[difficultyLevel];
       const defaultWidth = TRACK_DEFAULT_WIDTHS[step.track];
@@ -596,10 +510,15 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
       allTimeBest = 0;
       currentPhase = TWO_PHASE ? 0 : 1;
       currentSpeed = TWO_PHASE ? SLOW_SPEED : SPEED_MULT;
+      // New level = new robustness statistics. Old window is irrelevant.
+      robustEliteWindow = [];
+      // Reset clone-test ratchet — the new level's adapter starts fresh,
+      // so any prior clone-test stats are meaningless.
+      bestWeightsCloneStats = null;
       const widthNote = step.widthDelta !== 0 ? ` (width: ${defaultWidth + step.widthDelta})` : '';
       const speedNote = TWO_PHASE ? ` @ ${currentSpeed.toFixed(1)}x slow` : '';
       console.log(`\n  >>> ESCALATION: Level ${difficultyLevel} -> ${step.track}${widthNote}${speedNote}`);
-      console.log(`  >>> Base frozen; new LoRA adapter (rank 2, ~88 params) added for this level\n`);
+      console.log(`  >>> Base frozen; new LoRA adapter (rank ${LORA_RANK_OVERRIDE}, ~${(NUM_INPUTS + HIDDEN_SIZE) * LORA_RANK_OVERRIDE + (HIDDEN_SIZE + 2) * LORA_RANK_OVERRIDE} params) added for this level\n`);
     }
   }
 
@@ -637,9 +556,11 @@ for (let gen = 1; gen <= NUM_GENS; gen++) {
   }
 }
 
-// Save best brain
+// Save best brain — both as the canonical OUTPUT_FILE and as a final-level
+// checkpoint, so models/ has a complete -L0..-L{N} progression on disk.
 mkdirSync(dirname(OUTPUT_FILE), { recursive: true });
 writeFileSync(OUTPUT_FILE, JSON.stringify(bestWeights, null, 2));
+saveLevelCheckpoint(difficultyLevel, bestWeights);
 const totalTime = ((performance.now() - t0) / 1000).toFixed(1);
 console.log(`\n  Done! ${NUM_GENS} generations in ${totalTime}s`);
 console.log(`  Best lap: ${bestLapTime < Infinity ? (bestLapTime / 60).toFixed(1) + 's' : 'none'}`);

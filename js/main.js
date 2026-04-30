@@ -2,8 +2,15 @@ import * as THREE from 'three';
 import { Track } from './track.js?v=29';
 import { initialCars, nextGeneration, restoreState, persistState } from './evolution.js?v=29';
 import { Hud } from './hud.js?v=29';
-import { createQuitController, isDebugMode, parseBrainJson, parseVisualRuntimeParams } from './main-utils.js?v=29';
+import {
+  createQuitController,
+  getViewportSize,
+  isDebugMode,
+  parseBrainJson,
+  parseVisualRuntimeParams,
+} from './main-utils.js?v=29';
 import { TRACK_DEFAULT_WIDTHS } from './evolution-core.js?v=29';
+import { TRAINING_STATE_STORAGE_KEY } from './storage-keys.js?v=29';
 
 const state = {
   renderer: null,
@@ -51,8 +58,8 @@ export function main(canvas, hudCanvas) {
   }
   // Viewport may be 0×0 when loaded hidden (e.g., in a background iframe).
   // Fall back to a sane default so canvases can render; real resize handled later.
-  const getW = () => window.innerWidth || document.documentElement.clientWidth || 1024;
-  const getH = () => window.innerHeight || document.documentElement.clientHeight || 768;
+  const getW = () => getViewportSize().width;
+  const getH = () => getViewportSize().height;
 
   // ─── Renderer ──────────────────────────────────
   state.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -127,7 +134,7 @@ export function main(canvas, hudCanvas) {
   const allowedTracks = Object.keys(TRACK_DEFAULT_WIDTHS);
   const params = parseVisualRuntimeParams(window.location.search, { allowedTracks });
   if (params.fresh) {
-    try { localStorage.removeItem('f1-neuroevo-state'); } catch {}
+    try { localStorage.removeItem(TRAINING_STATE_STORAGE_KEY); } catch {}
   }
   if (params.trackType) state.settings.trackType = params.trackType;
   if (params.numCars != null) state.settings.numCars = params.numCars;
@@ -293,7 +300,7 @@ export function main(canvas, hudCanvas) {
       state._plateauFinishedRateHistory = [];
       state._plateauStatus = null;
       state._escalationStatus = null;
-      try { localStorage.removeItem('f1-neuroevo-state'); } catch {}
+      try { localStorage.removeItem(TRAINING_STATE_STORAGE_KEY); } catch {}
       state.bestCar = null;
       state.cameraMode = 'top';
       document.getElementById('cam-mode').textContent = 'top';

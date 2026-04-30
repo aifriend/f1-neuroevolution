@@ -184,6 +184,21 @@ export class NeuralCar {
     };
   }
 
+  // Replace ALL prior-level adapters (keys < currentLevel) with the
+  // champion's frozen versions. The adapter at `currentLevel` (the actively
+  // training one) is left untouched so evolutionary diversity is preserved.
+  // This is what stops random-base/random-adapter children from "winning"
+  // the elite slot and silently erasing prior-level mastery from bestWeights.
+  setPriorAdapters(externalAdapters) {
+    if (!externalAdapters) return;
+    for (const key of Object.keys(externalAdapters)) {
+      const lv = Number(key);
+      if (!Number.isFinite(lv) || lv === this.currentLevel) continue;
+      // Only copy adapters for OTHER levels — preserves search on currentLevel.
+      this.adapters[lv] = cloneAdapter(externalAdapters[key]);
+    }
+  }
+
   // Compute effective W1 and W2 for the current level.
   // Level 0: just base. Level >= 1: base + A·B for the current adapter.
   _effectiveWeights() {

@@ -5,6 +5,11 @@ node_modules/
 best-brain-*.json
 training-live*.log
 training.log
+# Per-run dwell checkpoints written by train.js. The handful of canonical
+# baseline brains in models/ (committed) stay tracked; ad-hoc dwell runs
+# (e.g. silverstone-dwell-v8-L2.json) shouldn't pollute git.
+models/*-dwell*.json
+models/best-brain-*.json
 
 # Autoresearch intermediate state
 .autoresearch/results.jsonl

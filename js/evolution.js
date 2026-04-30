@@ -11,8 +11,9 @@ import {
 } from './evolution-core.js?v=29';
 import { Track } from './track.js?v=29';
 import { buildPersistPayload } from './persistence.js?v=29';
+import { TRAINING_STATE_STORAGE_KEY } from './storage-keys.js?v=29';
 
-const STORAGE_KEY = 'f1-neuroevo-state';
+const STORAGE_KEY = TRAINING_STATE_STORAGE_KEY;
 
 function _persistState(state, options = {}) {
   try {
