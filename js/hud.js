@@ -1,8 +1,9 @@
 // 2D canvas overlay: training monitor dashboard
 // Top-left: stats | Bottom-left: neural network | Bottom-right: lap graph
 
-import { NUM_SENSORS, NUM_INPUTS, HIDDEN_SIZE } from './nn.js';
+import { NUM_SENSORS, NUM_INPUTS, HIDDEN_SIZE } from './nn.js?v=29';
 import { DIFFICULTY_LADDER } from './evolution-core.js?v=29';
+import { getViewportSize } from './main-utils.js?v=29';
 
 export class Hud {
   constructor(canvas) {
@@ -17,9 +18,7 @@ export class Hud {
 
   resize() {
     const dpr = window.devicePixelRatio || 1;
-    // Viewport may report 0 in hidden iframes; use fallback so canvas renders
-    const w = window.innerWidth || document.documentElement.clientWidth || 1024;
-    const h = window.innerHeight || document.documentElement.clientHeight || 768;
+    const { width: w, height: h } = getViewportSize();
     this.canvas.width = w * dpr;
     this.canvas.height = h * dpr;
     this.canvas.style.width = w + 'px';
@@ -34,8 +33,7 @@ export class Hud {
 
   render(state) {
     const ctx = this.ctx;
-    const w = window.innerWidth || document.documentElement.clientWidth || 1024;
-    const h = window.innerHeight || document.documentElement.clientHeight || 768;
+    const { width: w, height: h } = getViewportSize();
     ctx.clearRect(0, 0, w, h);
 
     this._drawStats(ctx, state, w);

@@ -78,6 +78,8 @@ describe('computeAdaptiveMutation', () => {
       currentMutation: 0.2,
       hasCompletedLap: true,
       currentDifficultyLevel: 2,
+      // Robust population: 30% finishing — clears the 10% gate.
+      currentFinisherRate: 0.3,
       plateauStatus: {
         isPlateau: true,
         confidence: 0.87,
@@ -89,6 +91,31 @@ describe('computeAdaptiveMutation', () => {
     expect(result.escalate).toBe(true);
     expect(result.escalationStatus.reason).toBe('plateau_confirmed');
     expect(result.escalationStatus.confidence).toBeCloseTo(0.87);
+  });
+
+  it('blocks escalation when only a fragile elite is lapping (lucky-elite gate)', () => {
+    const result = computeAdaptiveMutation({
+      bestScore: 10,
+      allTimeBest: 10,
+      stagnantGens: 4,
+      baseMutation: 0.15,
+      currentMutation: 0.2,
+      hasCompletedLap: true,
+      currentDifficultyLevel: 2,
+      // Only ~3% of the population is lapping — adapter is fragile.
+      currentFinisherRate: 0.03,
+      minFinisherRateForEscalation: 0.10,
+      plateauStatus: {
+        isPlateau: true,
+        confidence: 0.95,
+        remainingChecks: 0,
+        requiredChecks: 3,
+        consecutiveChecks: 5,
+      },
+    });
+    expect(result.escalate).toBe(false);
+    expect(result.escalationStatus.reason).toBe('fragile_adapter');
+    expect(result.escalationStatus.isRobustlyCapable).toBe(false);
   });
 
   it('does not escalate before first valid lap', () => {

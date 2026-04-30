@@ -227,3 +227,5 @@ export const TRACKS = {
     ],
   },
 };
+
+export const TRACK_IDS = Object.freeze(Object.keys(TRACKS));

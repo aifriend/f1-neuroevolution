@@ -159,6 +159,11 @@ export function evaluatePlateauStatus({
 }
 
 // ─── Adaptive Mutation + Curriculum Escalation ───────
+// `currentFinisherRate` is the fraction of cars in the latest generation that
+//   completed a lap. Used to gate escalation: a "lucky elite" plateau (only
+//   1-3 of 80 cars lap) shouldn't promote to the next track because the
+//   adapter is too fragile to retain. Default 0 disables the gate.
+// `minFinisherRateForEscalation` is the threshold (default 0.10 = 10% of cars).
 export function computeAdaptiveMutation({
   bestScore,
   allTimeBest,
@@ -171,6 +176,8 @@ export function computeAdaptiveMutation({
   lapImprovementsOnLevel = 0,
   hasCompletedLap = false,
   plateauStatus = null,
+  currentFinisherRate = 0,
+  minFinisherRateForEscalation = 0.10,
 }) {
   if (bestScore > allTimeBest) {
     return {
@@ -206,12 +213,19 @@ export function computeAdaptiveMutation({
   }
 
   const notMaxLevel = currentDifficultyLevel < DIFFICULTY_LADDER.length - 1;
-  const canEscalate = hasCompletedLap && notMaxLevel;
+  // Robustness gate: don't escalate on a "lucky elite" plateau where only a
+  // handful of cars lap. The adapter must be broadly capable. minFinisherRateForEscalation=0
+  // disables the gate (legacy behavior).
+  const isRobustlyCapable =
+    minFinisherRateForEscalation <= 0 ||
+    currentFinisherRate >= minFinisherRateForEscalation;
+  const canEscalate = hasCompletedLap && notMaxLevel && isRobustlyCapable;
   const escalate = canEscalate && Boolean(plateauStatus?.isPlateau);
 
   let escalationReason = 'plateau_monitoring';
   if (!notMaxLevel) escalationReason = 'max_level';
   else if (!hasCompletedLap) escalationReason = 'waiting_for_lap';
+  else if (!isRobustlyCapable) escalationReason = 'fragile_adapter';
   else if (escalate) escalationReason = 'plateau_confirmed';
 
   return {
@@ -230,6 +244,9 @@ export function computeAdaptiveMutation({
       relativeGain: plateauStatus?.relativeGain || 0,
       variance: plateauStatus?.variance || 0,
       finishedRateGain: plateauStatus?.finishedRateGain || 0,
+      currentFinisherRate,
+      minFinisherRateForEscalation,
+      isRobustlyCapable,
       remainingChecks: plateauStatus?.remainingChecks || PLATEAU_DEFAULTS.requiredConsecutiveChecks,
       requiredChecks: plateauStatus?.requiredChecks || PLATEAU_DEFAULTS.requiredConsecutiveChecks,
       consecutiveChecks: plateauStatus?.consecutiveChecks || 0,

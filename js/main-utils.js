@@ -16,6 +16,14 @@ function parseNumberParam(params, key) {
   return Number.isFinite(n) ? n : null;
 }
 
+export function getViewportSize() {
+  // Viewport may report 0 in hidden iframes/background tabs.
+  return {
+    width: window.innerWidth || document.documentElement.clientWidth || 1024,
+    height: window.innerHeight || document.documentElement.clientHeight || 768,
+  };
+}
+
 /**
  * Visual runtime URL params (all optional):
  * - track: one of allowedTracks

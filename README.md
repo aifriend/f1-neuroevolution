@@ -35,7 +35,7 @@ bash scripts/run-visual-monaco.sh
 
 Runtime controls in the UI:
 
-- Track: Monaco / Suzuka / Silverstone / Spaghetti / Serpentine / Inferno / Serpentine Bay / Ironcliff
+- Track: Monaco / Suzuka / Silverstone / Spaghetti / Serpentine / Inferno / Serpentine Bay / Ironcliff / Stormfront GP
 - Cars, speed multiplier, mutation rate
 - Timeout toggle and frame limit
 - Save Brain / Load Brain / Apply & Restart / Quit
@@ -72,13 +72,29 @@ tail -f training-live.log
 
 Available flags:
 
-- `--track` (`monaco` | `suzuka` | `silverstone` | `spaghetti` | `serpentine` | `inferno` | `serpentine_bay` | `ironcliff`)
+- `--track` (`monaco` | `suzuka` | `silverstone` | `spaghetti` | `serpentine` | `inferno` | `serpentine_bay` | `ironcliff` | `stormfront_gp`)
 - `--cars` (population size)
 - `--gens` (number of generations)
 - `--mutation` (base mutation rate)
 - `--timeout` (frame timeout)
 - `--speed` (simulation speed multiplier)
 - `--output` (output JSON file path; defaults to `models/best-brain-<track>.json`)
+
+## Run End-to-End Training Loop
+
+Use the wrapper to run a full cycle (test preflight + headless training + output validation):
+
+```bash
+npm run train:e2e
+```
+
+Example:
+
+```bash
+npm run train:e2e -- --track stormfront_gp --cars 120 --gens 2000
+```
+
+For options and full examples, see `docs/end-to-end-training.md`.
 
 ## Test
 
@@ -116,4 +132,5 @@ consistent level-jump decisions.
 - `js/`: simulation runtime (car, track, evolution, NN, HUD)
 - `train.js`: headless trainer using shared evolution logic
 - `tests/`: Vitest unit tests
+- `docs/end-to-end-training.md`: full training-loop wrapper usage
 - `docs/runtime-and-brain-contract.md`: runtime and brain validation contract

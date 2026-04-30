@@ -2,24 +2,58 @@
 
 ## Brain JSON Format
 
-Loaded brain files must be strict JSON with this shape:
+Loaded brain files must be strict JSON and match one of the supported formats.
+
+### V2 (current, LoRA-aware)
 
 ```json
 {
-  "w1": [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "... 5 rows total"],
-  "b1": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-  "w2": [[0.0, 0.0], "... 6 rows total"],
-  "b2": [0.0, 0.0]
+  "version": 2,
+  "rank": 2,
+  "currentLevel": 0,
+  "base": {
+    "w1": [[0.0, "... 16 cols"], "... 10 rows total"],
+    "b1": ["... 16 values"],
+    "w2": [[0.0, 0.0], "... 16 rows total"],
+    "b2": [0.0, 0.0]
+  },
+  "adapters": {
+    "1": {
+      "A1": [[0.0, 0.0], "... 10 rows total"],
+      "B1": [[0.0, "... 16 cols"], "... 2 rows total"],
+      "A2": [[0.0, 0.0], "... 16 rows total"],
+      "B2": [[0.0, 0.0], "... 2 rows total"]
+    }
+  }
 }
 ```
 
-Validation rules:
+Validation rules (from `js/brain.js` + `js/nn.js`):
 
-- `w1`: 5x6 matrix (`NUM_SENSORS` x `HIDDEN_SIZE`)
-- `b1`: 6 numbers
-- `w2`: 6x2 matrix (`HIDDEN_SIZE` x output size)
-- `b2`: 2 numbers
-- All values must be finite numbers
+- base network shape:
+  - `base.w1`: `NUM_INPUTS x HIDDEN_SIZE` (`10x16`)
+  - `base.b1`: `16` numbers
+  - `base.w2`: `HIDDEN_SIZE x OUTPUT_SIZE` (`16x2`)
+  - `base.b2`: `2` numbers
+- adapter shape for each `adapters.<level>` with rank `r`:
+  - `A1`: `10xr`
+  - `B1`: `rx16`
+  - `A2`: `16xr`
+  - `B2`: `rx2`
+- All numeric values must be finite numbers.
+
+### V1 (legacy, base-only)
+
+Legacy flat payloads are still accepted and treated as base weights:
+
+```json
+{
+  "w1": [[0.0, "... 16 cols"], "... 10 rows total"],
+  "b1": ["... 16 values"],
+  "w2": [[0.0, 0.0], "... 16 rows total"],
+  "b2": [0.0, 0.0]
+}
+```
 
 If validation fails, the simulator rejects the payload and keeps running.
 
@@ -30,6 +64,7 @@ If validation fails, the simulator rejects the payload and keeps running.
 - `Load Brain` validates structure before accepting.
 - A successfully loaded brain is applied to car `#0` in the next generation.
 - Runtime training state is auto-persisted to `localStorage` key `f1-neuroevo-state`
+  (exported as `TRAINING_STATE_STORAGE_KEY` in `js/storage-keys.js`)
   on quit, tab hide, and page unload.
 - Persisted state includes full population weights + generation counters + current
   settings so the next app start resumes training from the same snapshot (not only
@@ -118,7 +153,7 @@ Authoring guidelines for new control-point layouts:
 
 `train.js` and browser runtime use the same lap completion threshold:
 
-- `LAP_COMPLETION_PROGRESS = 0.995`
+- `HEADLESS_LAP_COMPLETION_PROGRESS = 0.995` (`js/headless-track.js`)
 
 When changing scoring/physics constants, update both paths together unless intentionally diverging.
 
