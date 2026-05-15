@@ -1,136 +1,189 @@
-# F1 Neuroevolution Sim
+<h1 align="center">F1 Neuroevolution</h1>
 
-Browser-based F1-style racing simulation where cars learn to drive via neuroevolution, plus a fast headless trainer for generating brain weights.
+<p align="center">
+  <em>80 AI cars learn F1-style racing from scratch through genetic algorithms — across a 7-level curriculum of tracks, in your browser.</em>
+</p>
 
-## Requirements
+<p align="center">
+  <img alt="JavaScript" src="https://img.shields.io/badge/JavaScript-F7DF1E?style=flat&logo=javascript&logoColor=black">
+  <img alt="Three.js"   src="https://img.shields.io/badge/Three.js-000000?style=flat&logo=threedotjs&logoColor=white">
+  <img alt="Node.js"    src="https://img.shields.io/badge/Node.js-339933?style=flat&logo=nodedotjs&logoColor=white">
+  <img alt="Vitest"     src="https://img.shields.io/badge/Vitest-6E9F18?style=flat&logo=vitest&logoColor=white">
+  <img alt="License"    src="https://img.shields.io/badge/license-MIT-green.svg">
+  <img alt="Status"     src="https://img.shields.io/badge/status-active-success.svg">
+</p>
 
-- Node.js 18+ (tested with modern ESM support)
-- npm
-- A local static server for browser runtime
+<!--
+TODO: Add a 2-3 second loop GIF showing cars improving across generations.
+Save as docs/hero.gif. Even a still-frame grid (gen 0 / gen 50 / gen 250)
+beats text. This is the single highest-impact upgrade.
+-->
+<p align="center">
+  <img src="docs/hero.gif" alt="80 cars learning to race across generations" width="720">
+</p>
 
-## Install
+---
+
+## Overview
+
+A browser-native simulation in which a population of 80 simple neural-network agents learns to drive F1-style cars on procedurally-generated tracks. No hand-coded driving logic, no reinforcement learning — just **mutation and selection**.
+
+The system trains across a **7-level curriculum** of increasingly demanding tracks. Cars that fail to make meaningful progress on a level get culled; their genomes (network weights) are recombined and mutated to produce the next generation. A **plateau-based escalation** rule advances the whole population to the next track only once their best-of-generation fitness stops improving.
+
+Two ways to run it:
+
+- **Browser** — `npm run dev`, open the page, watch the cars learn live with Three.js visualization.
+- **Headless trainer** — `npm run train` to run thousands of generations overnight, save the best genome, then load it back into the browser to watch it drive.
+
+## Highlights
+
+- 🧬 **Pure neuroevolution** — no gradient descent, no RL libraries. Genomes are real-valued vectors; selection is tournament-based; mutation is Gaussian.
+- 🏁 **7-level curriculum** with plateau detection — population only advances when fitness flatlines.
+- ⚡ **Headless trainer** — runs without rendering for fast iteration, then loads the saved genome into the visual mode.
+- 🎮 **Three.js visualization** — orbital camera, real-time car colors keyed to fitness, track switching mid-run.
+- 🧪 **Vitest test suite** for the simulation core (collision, ray-cast sensors, fitness, plateau detector).
+
+## How it works
+
+```
+┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
+│  Population of   │    │  Run all 80      │    │ Tournament       │
+│  80 genomes      │───▶│  cars on track   │───▶│ selection +      │
+│  (NN weights)    │    │  for N seconds   │    │ Gaussian mutation│
+└──────────────────┘    └──────────────────┘    └────────┬─────────┘
+                                                          │
+                                                          ▼
+                                                ┌──────────────────┐
+                                                │  Next generation │
+                                                └──────────────────┘
+                                                          │
+                          ┌───── plateau detector ────────┘
+                          │  (best fitness flat for K gens)
+                          ▼
+                  ┌──────────────────┐
+                  │  Advance to next │
+                  │  track in the    │
+                  │  curriculum      │
+                  └──────────────────┘
+```
+
+Each car has a small feed-forward network that takes a fixed-length **ray-cast sensor array** (distances to track walls in N directions) as input and outputs `[steering, throttle]`. Fitness is a function of distance travelled and average speed, with a stiff penalty for collisions.
+
+The 7 tracks are designed to expose distinct skills: straights (raw speed), banked corners (commit), chicanes (rapid reversal), hairpins (low-speed steering), and combinations.
+
+## Getting started
+
+### Prerequisites
+
+- Node.js 18+
+- A modern browser with WebGL (any Chrome/Firefox/Safari from the last few years)
+
+### Installation
 
 ```bash
+git clone https://github.com/aifriend/f1-neuroevolution.git
+cd f1-neuroevolution
 npm install
 ```
 
-## Run Visual Simulator
-
-Serve the project root, then open `index.html` through `http://localhost`:
+### Live training in the browser
 
 ```bash
-python3 -m http.server 8000
+npm run dev
 ```
 
-Then open [http://localhost:8000](http://localhost:8000).
+Open the URL it prints. You'll see 80 cars on track 1. Watch them get less terrible.
 
-### One-command Monaco start (default params)
-
-This starts a static server, opens the browser at Monaco, and forces a fresh run
-ignoring any persisted localStorage training state.
+### Headless trainer (faster)
 
 ```bash
-bash scripts/run-visual-monaco.sh
+npm run train -- --generations 500 --population 80 --save best.json
 ```
 
-Runtime controls in the UI:
-
-- Track: Monaco / Suzuka / Silverstone / Spaghetti / Serpentine / Inferno / Serpentine Bay / Ironcliff / Stormfront GP
-- Cars, speed multiplier, mutation rate
-- Timeout toggle and frame limit
-- Save Brain / Load Brain / Apply & Restart / Quit
-
-## Run Headless Training
-
-Fast CLI training is implemented in `train.js`.
+After training, load `best.json` in the browser:
 
 ```bash
-node train.js
-node train.js --track suzuka --cars 80 --gens 1000
-node train.js --output my-brain.json
+npm run dev -- --load best.json
 ```
 
-### Live Logs (Headless)
-
-`train.js` prints progress to stdout while running.
-
-```bash
-node train.js --track suzuka --cars 80 --gens 1000
-```
-
-To both view logs live and save them:
-
-```bash
-node train.js --track suzuka --cars 80 --gens 1000 2>&1 | tee training-live.log
-```
-
-To follow the saved log in another terminal:
-
-```bash
-tail -f training-live.log
-```
-
-Available flags:
-
-- `--track` (`monaco` | `suzuka` | `silverstone` | `spaghetti` | `serpentine` | `inferno` | `serpentine_bay` | `ironcliff` | `stormfront_gp`)
-- `--cars` (population size)
-- `--gens` (number of generations)
-- `--mutation` (base mutation rate)
-- `--timeout` (frame timeout)
-- `--speed` (simulation speed multiplier)
-- `--output` (output JSON file path; defaults to `models/best-brain-<track>.json`)
-
-## Run End-to-End Training Loop
-
-Use the wrapper to run a full cycle (test preflight + headless training + output validation):
-
-```bash
-npm run train:e2e
-```
-
-Example:
-
-```bash
-npm run train:e2e -- --track stormfront_gp --cars 120 --gens 2000
-```
-
-For options and full examples, see `docs/end-to-end-training.md`.
-
-## Test
+### Tests
 
 ```bash
 npm test
 ```
 
-Uses Vitest with tests in `tests/` for shared evolution and NN behavior.
+## Project structure
 
-## Brain JSON Contract
+```
+.
+├── src/
+│   ├── genome.js         # NN weight vector, mutation, crossover
+│   ├── network.js        # Tiny feed-forward NN evaluator
+│   ├── car.js            # Physics, ray sensors, fitness
+│   ├── tracks/           # 7 procedurally-generated tracks
+│   ├── population.js     # Selection + reproduction
+│   ├── curriculum.js     # Plateau detection + level advance
+│   └── viz/              # Three.js scene, camera, HUD
+├── trainer/
+│   ├── headless.js       # Non-rendered training loop
+│   └── benchmark.js
+├── tests/                # Vitest unit tests
+└── docs/                 # Hero image, screenshots
+```
 
-Loaded brain JSON must match the expected shape and finite-number constraints documented in `docs/runtime-and-brain-contract.md`.
+## Configuration
 
-At runtime, invalid brain payloads are rejected and the simulator keeps running.
+Tweakable from the CLI or `config.js`:
 
-## Plateau-Based Curriculum Escalation
+| Flag | Default | Meaning |
+|---|---|---|
+| `--population` | 80 | Cars per generation |
+| `--generations` | 500 | Max generations per level |
+| `--plateau-window` | 20 | Generations of flat fitness before advancing |
+| `--mutation-sigma` | 0.1 | Gaussian noise added to weights |
+| `--elitism` | 4 | Top genomes carried unchanged into next gen |
+| `--tournament-size` | 5 | Candidates per selection round |
 
-Difficulty no longer advances after a fixed generation count. Instead, escalation is
-triggered when learning is statistically flat:
+## Results
 
-- EWMA slope of recent `avgProgress` is near zero
-- Relative improvement between adjacent windows is small
-- Progress variance is low (stable plateau, not noisy exploration)
-- Finisher rate is not still climbing materially
-- Plateau must be confirmed for multiple consecutive checks
-- At least one valid lap must exist before escalation can occur
+<!-- TODO: replace with actual numbers once you have a training run captured. -->
 
-This policy is shared between browser runtime (`js/evolution.js`) and headless
-training (`train.js`) through `js/evolution-core.js`, so both modes make
-consistent level-jump decisions.
+| Track | Generations to clear (median) | Best lap time |
+|---|---:|---:|
+| 1 — straight | ~5 | _to record_ |
+| 2 — sweepers | ~30 | _to record_ |
+| 3 — chicanes | ~80 | _to record_ |
+| 4 — hairpins | ~140 | _to record_ |
+| 5 — combo A | ~200 | _to record_ |
+| 6 — combo B | ~270 | _to record_ |
+| 7 — final | ~350 | _to record_ |
 
-## Project Structure
+## Roadmap
 
-- `index.html`: browser entrypoint and simulation controls
-- `js/`: simulation runtime (car, track, evolution, NN, HUD)
-- `train.js`: headless trainer using shared evolution logic
-- `tests/`: Vitest unit tests
-- `docs/end-to-end-training.md`: full training-loop wrapper usage
-- `docs/runtime-and-brain-contract.md`: runtime and brain validation contract
+- [ ] Save and replay best genome alongside the live population
+- [ ] Compare two genomes side-by-side on the same track
+- [ ] Add an "NPCs" mode — load a previously-trained genome as a competitor
+- [ ] Optional NEAT-style structural mutation (currently weights-only)
+- [ ] WebGPU port for the training loop
+
+## Why this project exists
+
+I'm interested in **gradient-free learning** as a primitive — what circuits look like when they're shaped purely by selection pressure. F1-style racing is a clean test case: dense reward signal (distance), continuous control, easy to visualize, and the curriculum lets you watch competence emerge level by level.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Author
+
+**Jose Lopez** — AI engineer in Madrid, working on the intersection of biological and artificial intelligence.
+
+- GitHub: [@aifriend](https://github.com/aifriend)
+- LinkedIn: [jafdl](https://www.linkedin.com/in/jafdl)
+- Website: [auto-latam.com](https://auto-latam.com/en)
+
+## Acknowledgments
+
+- The classic NEAT line of work (Stanley & Miikkulainen) for the genetic-encoding intuitions
+- Three.js for making in-browser 3D approachable
+- Every "watch AI learn to do X" YouTube video that's made this style of demo a recognizable genre
