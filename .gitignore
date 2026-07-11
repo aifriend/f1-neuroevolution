@@ -24,3 +24,4 @@ models/best-brain-*.json
 # Logs
 *.log
 !README.md
+.claude/
