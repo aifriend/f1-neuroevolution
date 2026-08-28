@@ -86,9 +86,11 @@ Supported params (all optional):
 - `timeoutFrames`: frame timeout duration, clamped to `100..5000`
 - `fresh`: `1` clears persisted training state (`localStorage` key `f1-neuroevo-state`) before starting; otherwise the runtime may restore saved state
 
-### One-command Monaco Start
+### Fresh Monaco Start
 
-`scripts/run-visual-monaco.sh` starts a static server and opens a URL with default params:
+Serve the project root and open this URL for a default Monaco training run:
+
+`http://localhost:8000/?track=monaco&cars=30&speed=1&mutation=0.08&timeout=1&timeoutFrames=3500&fresh=1`
 
 - `track=monaco`
 - `cars=30`

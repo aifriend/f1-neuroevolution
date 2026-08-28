@@ -174,6 +174,10 @@ export function nextGeneration(state) {
     lapImprovementsOnLevel: state._lapImprovementsOnLevel || 0,
     hasCompletedLap: state.bestLapTime < Infinity,
     plateauStatus,
+    // Robustness gate: refuse to escalate while only a "lucky elite"
+    // 1-3/N cars are lapping. Adapter must be broadly capable first.
+    // Threshold matches train.js's default (evolution-core default: 0.10).
+    currentFinisherRate: finishedRate,
   });
   state._escalationGens = (state._escalationGens || 0) + 1;
   state.allTimeBest = mutationState.allTimeBest;

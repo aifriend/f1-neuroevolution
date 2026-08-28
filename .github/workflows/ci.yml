@@ -31,3 +31,6 @@ jobs:
 
       - name: Run tests
         run: npm test
+
+      - name: Run integration suite
+        run: node test-integration.js

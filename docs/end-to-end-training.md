@@ -31,7 +31,10 @@ What it does:
 | `--cloneTestK` | 3 | Top-K candidates from robust window to test each round. |
 
 The clone-test gating + robustness gate combination is what closed the
-"L2/L4 = 0/16 finishers" eval-vs-train gap. See
+"L2/L4 = 0/16 finishers" eval-vs-train gap — verified end-to-end by the
+2026-08-27 full-curriculum run, whose flagship brain retains all 10 levels at
+1.0x speed under `cross-track-eval.js` (L2 silverstone 12/12, L4 serpentine
+12/12; 10/12 on L0, 12/12 on every other level). See
 `docs/runtime-and-brain-contract.md` for mechanism details.
 
 ## Common Usage
