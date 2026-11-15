@@ -2,6 +2,9 @@
   "name": "sim-games-f1-neuroevolution",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "test": "vitest run",
     "train:e2e": "node scripts/run-full-training.js",
