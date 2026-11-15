@@ -44,7 +44,7 @@ export function restoreState(state) {
       restoreTrack = state.settings.trackType;
     }
     let widthOverride = null;
-    if (save.bestWeights) {
+    if (save.bestWeights && validateBrainWeights(save.bestWeights).ok) {
       state._bestWeights = save.bestWeights;
       state._loadedWeights = save.bestWeights; // inject into gen 0
     }
