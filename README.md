@@ -71,7 +71,7 @@ After the population masters a level, escalation is gated on a plateau signal: E
 
 ### Prerequisites
 
-- Node.js 20+ (CI runs 20.x and 22.x)
+- Node.js 20 or newer (`package.json` declares `"engines": { "node": ">=20" }`; CI runs 20.x and 22.x)
 - A modern browser with WebGL
 
 ### Installation
